@@ -237,4 +237,5 @@ client.on('interactionCreate', async (i) => {
   }
 });
 
-registerCommands().then(() => client.login(TOKEN));
+registerCommands().then(() => client.login(process.env.DISCORD_TOKEN));
+
