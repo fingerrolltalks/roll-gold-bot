@@ -1,3 +1,5 @@
+
+
 // Chart Assassin — Discord Bot PRO v3 (Node.js)
 // Features:
 // • Live quotes for stocks/ETFs/crypto with timestamp + source
@@ -32,10 +34,10 @@ dayjs.extend(utc);
 dayjs.extend(tz);
 
 // --- yahoo-finance2 global config (gentle pacing + retries)
-yf2.setGlobalConfig({
+yf2.default.setGlobalConfig({
   headers: { 'User-Agent': 'ChartAssassinBot/1.0 (+bot)' },
-  queue: { concurrency: 2, interval: 300 }, // small queue
-  retry: { maxRetries: 2 }                   // auto-retry
+  queue: { concurrency: 2, interval: 300 },
+  retry: { maxRetries: 2 }
 });
 
 const TOKEN = process.env.DISCORD_TOKEN;
