@@ -14,5 +14,8 @@
     "openai": "^4.0.0",
     "tzdata": "^1.0.46",
     "yahoo-finance2": "^2.13.3"
+  },
+  "engines": {
+    "node": ">=18 <23"
   }
 }
