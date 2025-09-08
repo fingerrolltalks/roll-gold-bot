@@ -208,13 +208,14 @@ async function registerCommands() {
   await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
 }
 
-// ✅ fixed: use clientReady instead of ready
+// ✅ use the new event name so the warning disappears
 client.on('clientReady', () => console.log(`Logged in as ${client.user.tag}`));
 
+// ---- interactions ---------------------------------------------------------
 function detectTickers(s) {
   const words = (s || '').toUpperCase().replace(/[^A-Z0-9.\-\s$]/g, ' ').split(/\s+/);
   const raw = words.map((w) => w.replace(/^\$/, '')).filter(Boolean);
-  const uniq = [...new Set(raw.filter(isTicker))];
+  const uniq = [...new Set(raw.filter((x) => /^[A-Z][A-Z0-9.\-]{0,10}(?:-USD)?$/.test(x)))];
   return uniq.length ? uniq : ['NVDA'];
 }
 
@@ -232,7 +233,15 @@ client.on('interactionCreate', async (i) => {
         const q = await getQuote(t);
         const { head, core } = banner(t, q);
         const w = q.type === 'EQUITY' || q.type === 'ETF' ? await weeklyOptions(t, q.price).catch(() => null) : null;
-        const block = ['⚡ EXPRESS ALERT — OPENING PLAY', '', head, ...core, ...optLines(w), '— — —', 'This is not financial advice. Do your own research.'];
+        const block = [
+          '⚡ EXPRESS ALERT — OPENING PLAY',
+          '',
+          head,
+          ...core,
+          ...optLines(w),
+          '— — —',
+          'This is not financial advice. Do your own research.'
+        ];
         chunks.push(block.join('\n'));
       }
       await i.editReply(chunks.join('\n\n'));
@@ -245,7 +254,7 @@ client.on('interactionCreate', async (i) => {
   if (i.commandName === 'deep') {
     await i.deferReply();
     try {
-      const t = norm(i.options.getString('ticker') || 'SPY');
+      const t = (i.options.getString('ticker') || 'SPY').toUpperCase();
       const q = await getQuote(t);
       const end = dayjs().tz(TZ);
       const start = end.subtract(90, 'day');
@@ -257,8 +266,8 @@ client.on('interactionCreate', async (i) => {
       const last30 = hist.slice(-30);
       const closes = last30.map((c) => c.close);
       const sma = (a, n) => a.slice(-n).reduce((x, y) => x + y, 0) / Math.min(n, a.length);
-      const sma20 = sma(closes, 20),
-        sma50 = sma(closes, 50);
+      const sma20 = sma(closes, 20);
+      const sma50 = sma(closes, 50);
       const pdh = last30.at(-2)?.high;
       const pdl = last30.at(-2)?.low;
       const trend = sma20 > sma50 ? '🟢 Up (20>50)' : '🟡 Mixed/Down (20<=50)';
@@ -282,14 +291,14 @@ client.on('interactionCreate', async (i) => {
 
   if (i.commandName === 'scalp') {
     await i.deferReply();
-    const sym = norm(i.options.getString('symbol') || 'BTC-USD');
+    const sym = (i.options.getString('symbol') || 'BTC-USD').toUpperCase();
     try {
       const q = await getQuote(sym);
       const r = 0.006;
-      const s1 = +(q.price * (1 - r)).toFixed(2),
-        s2 = +(q.price * (1 - 2 * r)).toFixed(2);
-      const t1 = +(q.price * (1 + r)).toFixed(2),
-        t2 = +(q.price * (1 + 2 * r)).toFixed(2);
+      const s1 = +(q.price * (1 - r)).toFixed(2);
+      const s2 = +(q.price * (1 - 2 * r)).toFixed(2);
+      const t1 = +(q.price * (1 + r)).toFixed(2);
+      const t2 = +(q.price * (1 + 2 * r)).toFixed(2);
       const txt = [
         `CRYPTO SCALP ⚡ — ${sym} @ ${fmt(q.price)} (${q.chg >= 0 ? '+' : ''}${fmt(q.chg)}%) — ${ts()}`,
         `• Bias: ${q.chg >= 0 ? '🟢' : '🟡'} Range scalp via VWAP`,
@@ -308,7 +317,7 @@ client.on('interactionCreate', async (i) => {
 
   if (i.commandName === 'flow') {
     await i.deferReply();
-    const t = norm(i.options.getString('ticker'));
+    const t = (i.options.getString('ticker') || '').toUpperCase();
     await i.editReply(
       `OPTIONS FLOW 🔍 — ${t}\n• Provider not configured. Add API + code to enable.\n• Meanwhile, use /alert for live levels and /deep for HTF.`
     );
@@ -333,4 +342,18 @@ client.on('interactionCreate', async (i) => {
   }
 });
 
-registerCommands().then(() => client.login(TOKEN
+// ---- start up -------------------------------------------------------------
+// keep the process alive in “worker” environments
+setInterval(() => {}, 60 * 1000);
+
+// log unhandled errors instead of crashing silently
+process.on('uncaughtException', (err) => console.error('Uncaught:', err));
+process.on('unhandledRejection', (err) => console.error('Unhandled:', err));
+
+// register slash commands, then login
+registerCommands()
+  .then(() => client.login(TOKEN))
+  .catch((e) => {
+    console.error('Startup error:', e?.message || e);
+    process.exit(1);
+  });
