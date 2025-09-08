@@ -28,7 +28,15 @@ import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc.js';
 import tz from 'dayjs/plugin/timezone.js';
 
-dayjs.extend(utc); dayjs.extend(tz);
+dayjs.extend(utc);
+dayjs.extend(tz);
+
+// --- yahoo-finance2 global config (gentle pacing + retries)
+yf2.setGlobalConfig({
+  headers: { 'User-Agent': 'ChartAssassinBot/1.0 (+bot)' },
+  queue: { concurrency: 2, interval: 300 }, // small queue
+  retry: { maxRetries: 2 }                   // auto-retry
+});
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
