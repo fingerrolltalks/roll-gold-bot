@@ -35,9 +35,7 @@ dayjs.extend(tz);
 
 // --- yahoo-finance2 global config (gentle pacing + retries)
 yf2.default.setGlobalConfig({
-  headers: { 'User-Agent': 'ChartAssassinBot/1.0 (+bot)' },
-  queue: { concurrency: 2, interval: 300 },
-  retry: { maxRetries: 2 }
+  headers: { 'User-Agent': 'ChartAssassinBot/1.0 (+bot)' }
 });
 
 const TOKEN = process.env.DISCORD_TOKEN;
