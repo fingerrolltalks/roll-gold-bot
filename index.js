@@ -33,9 +33,11 @@ import tz from 'dayjs/plugin/timezone.js';
 dayjs.extend(utc);
 dayjs.extend(tz);
 
-// --- yahoo-finance2 global config (gentle pacing + retries)
+// --- yahoo-finance2 global config (safe header injection)
 yf2.default.setGlobalConfig({
-  headers: { 'User-Agent': 'ChartAssassinBot/1.0 (+bot)' }
+  fetchOptions: {
+    headers: { 'User-Agent': 'ChartAssassinBot/1.0 (+bot)' }
+  }
 });
 
 const TOKEN = process.env.DISCORD_TOKEN;
