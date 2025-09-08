@@ -1,4 +1,4 @@
-// Chart Assassin — Discord Live Options Bot (SAFE v3)
+// Chart Assassin — Discord Live Options Bot (SAFE v3.1)
 // ---------------------------------------------------
 // Commands: /alert, /deep, /scalp, /flow (placeholder), /health
 // Env (Railway → Variables):
@@ -21,7 +21,7 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const POLY = process.env.POLYGON_KEY;
 const TZ = process.env.TZ || 'UTC';
 
-console.log('Boot: Chart Assassin v3 SAFE', new Date().toISOString(), 'TZ=', TZ);
+console.log('Boot: Chart Assassin v3.1 SAFE', new Date().toISOString(), 'TZ=', TZ);
 if (!TOKEN || !CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID — set in Railway → Variables.');
   process.exit(1);
@@ -50,7 +50,6 @@ function getSession(now = dayjs().tz('America/New_York')) {
 
 // ---- Data: Quotes ---------------------------------------------------------
 async function yahooQuoteFull(ticker) {
-  // Primary (rich)
   try {
     const q = await yf2.default.quoteSummary(ticker, { modules: ['price'] });
     const p = q?.price;
@@ -64,7 +63,6 @@ async function yahooQuoteFull(ticker) {
     const type = p.quoteType || 'EQUITY';
     return { price: Number(price), chg: Number(chg), type, source: 'Yahoo' };
   } catch {
-    // Fallback (simpler, more resilient)
     const q = await yf2.default.quote(ticker);
     const price = q?.regularMarketPrice ?? q?.postMarketPrice ?? q?.preMarketPrice;
     const chg = q?.regularMarketChangePercent ?? 0;
@@ -210,7 +208,8 @@ async function registerCommands() {
   await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
 }
 
-client.once('ready', () => console.log(`Logged in as ${client.user.tag}`));
+// ✅ fixed: use clientReady instead of ready
+client.on('clientReady', () => console.log(`Logged in as ${client.user.tag}`));
 
 function detectTickers(s) {
   const words = (s || '').toUpperCase().replace(/[^A-Z0-9.\-\s$]/g, ' ').split(/\s+/);
@@ -334,4 +333,4 @@ client.on('interactionCreate', async (i) => {
   }
 });
 
-registerCommands().then(() => client.login(TOKEN));
+registerCommands().then(() => client.login(TOKEN
