@@ -1,18 +1,23 @@
-// Discord Live Options Bot — Option A FINAL (with /health)
-// Works for: equities, ETFs, crypto (spot). Live quotes + weekly options ATM±1.
-// Slash commands: /alert, /deep, /health
-// Primary data: Yahoo Finance (all). Secondary: Polygon (equities/ETFs, optional)
-// Timezone: America/New_York (configurable via TZ env)
+// Chart Assassin — Discord Bot PRO v3 (Node.js)
+// Features:
+// • Live quotes for stocks/ETFs/crypto with timestamp + source
+// • Auto multi-ticker detection from free text (/alert text: ...)
+// • EXPRESS ALERT ⚡ (default)
+// • DEEP DIVE 📚 (HTF, PDH/PDL, SMA20/50)
+// • CRYPTO SCALPS ⚡ quick levels for majors
+// • OPTIONS (weekly ATM±1) for equities/ETFs
+// • Discrepancy flag if Polygon vs Yahoo > 0.5%
+// • Session tag (PRE/RTH/POST/OFF), NY time
+// • Flow placeholder (/flow) — wire any provider later
 // -----------------------------------------------------------------------
 // Setup
-//   npm init -y
 //   npm i discord.js axios dayjs yahoo-finance2 dotenv tzdata
-//   node index.js
-// .env (Railway or local)
-//   DISCORD_TOKEN=your_bot_token
-//   DISCORD_CLIENT_ID=your_app_id
-//   POLYGON_KEY=your_polygon_key   # optional
+// .env
+//   DISCORD_TOKEN=xxxx
+//   DISCORD_CLIENT_ID=xxxx
+//   POLYGON_KEY= # optional
 //   TZ=America/New_York
+// Start: node index.js
 // -----------------------------------------------------------------------
 
 import 'dotenv/config';
@@ -30,212 +35,235 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const POLY = process.env.POLYGON_KEY;
 const TZ = process.env.TZ || 'UTC';
 
-// --- Helpers ---------------------------------------------------------------
+// ---------- helpers -------------------------------------------------------
 const ts = () => dayjs().tz(TZ).format('MMM D, HH:mm z');
 const fmt = (n, d = 2) => Number(n).toFixed(d);
-const normalizeTicker = (s) => {
-  const x = (s || '').trim().toUpperCase();
-  const map = { 'BRK.B': 'BRK-B', 'BRK.A': 'BRK-A' };
-  return map[x] || x.replace(/\s+/g, '');
+const clean = (s) => (s||'').trim();
+const norm = (s) => {
+  const x = clean(s).toUpperCase();
+  const map = { 'BRK.B':'BRK-B','BRK.A':'BRK-A'};
+  return map[x] || x.replace(/\s+/g,'');
 };
-const validTicker = (s) => /^[A-Z0-9.+\-=_/:]{1,15}$/.test(s);
+const isTicker = (s) => /^[A-Z][A-Z0-9.\-]{0,6}(?:-USD)?$/.test(s);
 
-function getSession(now = dayjs().tz('America/New_York')) {
-  const dow = now.day(); // 0=Sun .. 6=Sat
-  const isWeekday = dow >= 1 && dow <= 5;
-  const mins = now.hour() * 60 + now.minute();
-  if (!isWeekday) return 'OFF';
-  if (mins >= 570 && mins < 960) return 'RTH'; // 09:30-16:00 ET
-  if (mins >= 240 && mins < 570) return 'PRE'; // 04:00-09:30 ET
-  if (mins >= 960 && mins < 1200) return 'POST'; // 16:00-20:00 ET
+function getSession(now = dayjs().tz('America/New_York')){
+  const dow = now.day();
+  const mins = now.hour()*60+now.minute();
+  if (dow===0||dow===6) return 'OFF';
+  if (mins>=240 && mins<570) return 'PRE';
+  if (mins>=570 && mins<960) return 'RTH';
+  if (mins>=960 && mins<1200) return 'POST';
   return 'OFF';
 }
 
-// Yahoo type-aware quote (works for equities/ETFs/crypto/indices)
-async function yahooQuoteFull(ticker) {
-  const q = await yf2.default.quoteSummary(ticker, { modules: ['price'] });
-  const p = q?.price; if (!p) throw new Error('No quote');
+// ---------- data ----------------------------------------------------------
+async function yahooQuoteFull(t){
+  const q = await yf2.default.quoteSummary(t,{modules:['price']});
+  const p = q?.price; if(!p) throw new Error('No quote');
   const price = p.regularMarketPrice ?? p.postMarketPrice ?? p.preMarketPrice;
   const chg = p.regularMarketChangePercent ?? p.postMarketChangePercent ?? p.preMarketChangePercent ?? 0;
-  const type = p.quoteType || 'EQUITY'; // EQUITY/ETF/CRYPTOCURRENCY/INDEX
-  return { price: Number(price), chg: Number(chg), type, source: 'Yahoo Finance' };
+  const type = p.quoteType || 'EQUITY';
+  return { price:Number(price), chg:Number(chg), type, source:'Yahoo' };
+}
+async function polygonQuote(t){
+  if(!POLY) return null;
+  try{
+    const nb = await axios.get(`https://api.polygon.io/v2/last/nbbo/${t}`,{params:{apiKey:POLY}}).then(r=>r.data?.results);
+    const price = nb ? (nb.bid.price+nb.ask.price)/2 : null; if(!price) return null;
+    const prev = await axios.get(`https://api.polygon.io/v2/aggs/ticker/${t}/prev`,{params:{apiKey:POLY}}).then(r=>r.data?.results?.[0]);
+    const chg = prev ? ((price-prev.c)/prev.c)*100 : 0;
+    return { price, chg, source:'Polygon' };
+  }catch{ return null; }
 }
 
-// Polygon quote (optional, equities/ETFs only)
-async function polygonQuote(ticker) {
-  if (!POLY) return null;
-  try {
-    const r = await axios.get(`https://api.polygon.io/v2/last/nbbo/${ticker}`, { params: { apiKey: POLY } });
-    const nbbo = r.data?.results; const price = nbbo ? (nbbo.bid.price + nbbo.ask.price) / 2 : null;
-    if (!price) return null;
-    const pr = await axios.get(`https://api.polygon.io/v2/aggs/ticker/${ticker}/prev`, { params: { apiKey: POLY } });
-    const prev = pr.data?.results?.[0];
-    const chg = prev ? ((price - prev.c) / prev.c) * 100 : null;
-    return { price, chg, source: 'Polygon' };
-  } catch { return null; }
-}
-
-async function getQuote(ticker) {
-  const y = await yahooQuoteFull(ticker);
-  if (y.type === 'EQUITY' || y.type === 'ETF') {
-    const p = await polygonQuote(ticker);
-    if (p) return { ...p, type: y.type, session: getSession(), source: 'Polygon (primary) → Yahoo (meta)' };
+async function getQuote(t){
+  const y = await yahooQuoteFull(t);
+  if(y.type==='EQUITY' || y.type==='ETF'){
+    const p = await polygonQuote(t);
+    if(p){
+      const diff = Math.abs((p.price - y.price)/y.price)*100;
+      const flag = diff>0.5 ? `⚠️ Discrepancy ${fmt(diff,2)}% (Poly vs Y)` : '';
+      return { ...p, type:y.type, session:getSession(), source:p.source, flag, alt:`Yahoo ${fmt(y.price)}` };
+    }
   }
-  return { ...y, session: getSession(), source: 'Yahoo Finance' }; // crypto/indices or no Polygon
+  return { ...y, session:getSession(), alt:null, flag:'' };
 }
 
-// Weekly options via Yahoo (equities/ETFs only)
-function nextFriday(now = dayjs().tz(TZ)) {
-  const dow = now.day();
-  const add = ((5 - dow) + 7) % 7 || 7; // next Fri
-  return now.add(add, 'day').startOf('day');
+// options (weeklies)
+function nextFriday(now=dayjs().tz(TZ)){
+  const add=((5-now.day())+7)%7||7; return now.add(add,'day').startOf('day');
 }
-
-async function getWeeklyOptions(ticker, spot) {
-  const meta = await yf2.default.options(ticker);
-  const exps = (meta?.expirationDates || []).map(d => dayjs.utc(d));
-  if (!exps.length) return null;
+async function weeklyOptions(t, spot){
+  const meta = await yf2.default.options(t);
+  const exps = (meta?.expirationDates||[]).map(d=>dayjs.utc(d));
+  if(!exps.length) return null;
   const target = nextFriday();
-  let chosen = exps.find(d => d.isAfter(target.subtract(1, 'minute')));
-  if (!chosen) chosen = exps[exps.length - 1];
-  const chain = await yf2.default.options(ticker, { date: chosen.toDate() });
-  const calls = chain?.calls || []; const puts = chain?.puts || [];
-  const strikes = [...new Set([...calls, ...puts].map(o => Number(o.strike)))].filter(Number.isFinite).sort((a,b)=>a-b);
-  if (!strikes.length) return null;
-  const atmIdx = strikes.reduce((best, s, i) => (Math.abs(s-spot) < Math.abs(strikes[best]-spot) ? i : best), 0);
-  const sATM = strikes[atmIdx]; const sPlus = strikes[Math.min(atmIdx+1, strikes.length-1)]; const sMinus = strikes[Math.max(atmIdx-1, 0)];
-  const pick = (arr, strike) => arr.find(o => Number(o.strike) === strike);
-  const cATM = pick(calls, sATM) || pick(calls, sPlus) || pick(calls, sMinus);
-  const pATM = pick(puts, sATM)  || pick(puts, sMinus) || pick(puts, sPlus);
-  return {
-    expiry: chosen.format('YYYY-MM-DD'),
-    strikes: { sMinus, sATM, sPlus },
-    call: cATM ? { contract: cATM.contractSymbol, bid: cATM.bid, ask: cATM.ask, iv: cATM.impliedVolatility } : null,
-    put:  pATM ? { contract: pATM.contractSymbol, bid: pATM.bid, ask: pATM.ask, iv: pATM.impliedVolatility } : null,
-    source: 'Yahoo Finance options'
-  };
+  let chosen = exps.find(d=>d.isAfter(target.subtract(1,'minute')))||exps.at(-1);
+  const ch = await yf2.default.options(t,{date:chosen.toDate()});
+  const calls=ch?.calls||[], puts=ch?.puts||[];
+  const strikes=[...new Set([...calls,...puts].map(o=>+o.strike))].filter(Number.isFinite).sort((a,b)=>a-b);
+  if(!strikes.length) return null;
+  const idx=strikes.reduce((b,s,i)=>Math.abs(s-spot)<Math.abs(strikes[b]-spot)?i:b,0);
+  const sATM=strikes[idx], sPlus=strikes[Math.min(idx+1,strikes.length-1)], sMinus=strikes[Math.max(idx-1,0)];
+  const pick=(a,k)=>a.find(o=>+o.strike===k);
+  const c=pick(calls,sATM)||pick(calls,sPlus)||pick(calls,sMinus);
+  const p=pick(puts ,sATM)||pick(puts ,sMinus)||pick(puts ,sPlus);
+  return { expiry:chosen.format('YYYY-MM-DD'), s:{sMinus,sATM,sPlus},
+           call:c?{cs:c.contractSymbol,bid:c.bid,ask:c.ask,iv:c.impliedVolatility}:null,
+           put:p? {cs:p.contractSymbol,bid:p.bid,ask:p.ask,iv:p.impliedVolatility}:null };
 }
 
-// Build EXPRESS alert text
-function buildSetup(tkr, price, chg, type, weekly, session, source) {
-  const entryLow = +(price * 0.995).toFixed(2);
-  const entryHigh = +(price * 1.005).toFixed(2);
-  const sl = +(price * 0.98).toFixed(2);
-  const t1 = +(price * 1.01).toFixed(2);
-  const t2 = +(price * 1.03).toFixed(2);
-  const t3 = +(price * 1.05).toFixed(2);
-  const bias = chg >= 0 ? '🟢' : '🟡';
-  const rr = ((t2 - price) / (price - sl)).toFixed(1);
-  const banner = `$${tkr} | ${fmt(price)} (${chg>=0?'+':''}${fmt(chg)}%) @ ${ts()} | ${bias} | Entry ${entryLow}-${entryHigh} | SL ${sl} | T: ${t1}/${t2}/${t3} | R:R ~${rr}`;
-
-  const optLines = (type === 'EQUITY' || type === 'ETF') && weekly ? [
-    `• Weekly: ${weekly.expiry} | ATM≈ ${weekly.strikes.sATM}`,
-    weekly.call ? `• Calls: ${weekly.call.contract} | ${fmt(weekly.call.bid)}/${fmt(weekly.call.ask)} IV ${fmt(weekly.call.iv*100,1)}%` : `• Calls: n/a`,
-    weekly.put  ? `• Puts : ${weekly.put.contract} | ${fmt(weekly.put.bid)}/${fmt(weekly.put.ask)} IV ${fmt(weekly.put.iv*100,1)}%`  : `• Puts : n/a`,
-  ] : [ type === 'CRYPTOCURRENCY' ? '• Options: n/a (crypto spot)' : '• Options: n/a (no chain)' ];
-
-  const lines = [
+// ---------- formats -------------------------------------------------------
+function banner(t, q){
+  const price = fmt(q.price), pct=(q.chg>=0?'+':'')+fmt(q.chg)+'%';
+  const bias = q.chg>=0? '🟢':'🟡';
+  const entryL = +(q.price*0.995).toFixed(2);
+  const entryH = +(q.price*1.005).toFixed(2);
+  const sl     = +(q.price*0.98).toFixed(2);
+  const t1=+(q.price*1.01).toFixed(2), t2=+(q.price*1.03).toFixed(2), t3=+(q.price*1.05).toFixed(2);
+  const rr = ((t2-q.price)/(q.price-sl)).toFixed(1);
+  const head = `$${t} | ${price} (${pct}) @ ${ts()} | ${bias} | Entry ${entryL}-${entryH} | SL ${sl} | T: ${t1}/${t2}/${t3} | R:R ~${rr}`;
+  const core = [
     `• Mode: Opening scalp ⚡ / swing 📆`,
     `• Bias: ${bias} Above VWAP favors calls`,
-    `• Session: ${session} | Source: ${source}`,
+    `• Session: ${q.session} | Source: ${q.source}${q.flag?` | ${q.flag}`:''}`,
     `• Key S/R: VWAP; ±1% band`,
     `• 🚫 SL: ${sl} — below structure`,
     `• 🎯 ${t1} / ${t2} / ${t3}`,
     `• Prob/Conf: 55% | Medium`,
     `• Mgmt: Trim @ T1, BE stop, trail EMA`,
     `• Alt: Lose VWAP → fade to band low`,
-    ...optLines,
-    `— — —`,
-    `This is not financial advice. Do your own research.`
   ];
-  return { banner, lines };
+  return { head, core };
 }
 
-// --- Discord ---------------------------------------------------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+function optLines(w){
+  if(!w) return ['• Options: n/a'];
+  return [
+    `• Weekly: ${w.expiry} | ATM≈ ${w.s.sATM}`,
+    w.call?`• Calls: ${w.call.cs} | ${fmt(w.call.bid)}/${fmt(w.call.ask)} IV ${fmt(w.call.iv*100,1)}%`:'• Calls: n/a',
+    w.put ?`• Puts : ${w.put.cs} | ${fmt(w.put.bid)}/${fmt(w.put.ask)} IV ${fmt(w.put.iv*100,1)}%` :'• Puts : n/a',
+  ];
+}
 
-async function registerCommands() {
-  const commands = [
-    new SlashCommandBuilder().setName('alert').setDescription('Live EXPRESS ALERT for a ticker')
-      .addStringOption(o => o.setName('ticker').setDescription('e.g., NVDA, AAPL, SPY, BTC-USD').setRequired(false)),
-    new SlashCommandBuilder().setName('deep').setDescription('DEEP DIVE with HTF context')
-      .addStringOption(o => o.setName('ticker').setDescription('e.g., SPY, TSLA, ETH-USD').setRequired(false)),
-    new SlashCommandBuilder().setName('health').setDescription('Check bot health & connectivity')
+// ---------- discord -------------------------------------------------------
+const client = new Client({ intents:[GatewayIntentBits.Guilds] });
+
+async function register(){
+  const cmds = [
+    new SlashCommandBuilder().setName('alert').setDescription('EXPRESS ALERT: live levels')
+      .addStringOption(o=>o.setName('text').setDescription('Ticker(s) or sentence, e.g. NVDA, AAPL or "please check NVDA"').setRequired(false)),
+    new SlashCommandBuilder().setName('deep').setDescription('DEEP DIVE: HTF context')
+      .addStringOption(o=>o.setName('ticker').setDescription('One ticker, e.g. SPY').setRequired(false)),
+    new SlashCommandBuilder().setName('scalp').setDescription('CRYPTO SCALPS: BTC/ETH/SOL/XRP/ADA/DOGE quick levels')
+      .addStringOption(o=>o.setName('symbol').setDescription('e.g., BTC-USD').setRequired(false)),
+    new SlashCommandBuilder().setName('flow').setDescription('OPTIONS FLOW placeholder (configure provider later)')
+      .addStringOption(o=>o.setName('ticker').setDescription('e.g., NVDA').setRequired(true)),
+    new SlashCommandBuilder().setName('health').setDescription('Health check: data + time + session')
   ].map(c=>c.toJSON());
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  const rest = new REST({version:'10'}).setToken(TOKEN);
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: cmds });
 }
 
-client.on('ready', () => console.log(`Logged in as ${client.user.tag}`));
+client.on('clientReady', ()=>console.log(`Logged in as ${client.user.tag}`));
 
-client.on('interactionCreate', async (i) => {
-  if (!i.isChatInputCommand()) return;
+function detectTickers(s){
+  const words = (s||'').toUpperCase().replace(/[^A-Z0-9\.\-\s$]/g,' ').split(/\s+/);
+  const raw = words.map(w=>w.replace(/^\$/,'')).filter(Boolean);
+  const uniq = [...new Set(raw.filter(isTicker))];
+  return uniq.length?uniq:[ 'NVDA' ];
+}
 
-  if (i.commandName === 'alert') {
+client.on('interactionCreate', async (i)=>{
+  if(!i.isChatInputCommand()) return;
+
+  if(i.commandName==='alert'){
     await i.deferReply();
-    let tkr = normalizeTicker(i.options.getString('ticker') || 'NVDA');
-    if (!validTicker(tkr)) { await i.editReply('Invalid ticker symbol.'); return; }
-    try {
-      const q = await getQuote(tkr);
-      const weekly = (q.type === 'EQUITY' || q.type === 'ETF') ? await getWeeklyOptions(tkr, q.price).catch(()=>null) : null;
-      const { banner, lines } = buildSetup(tkr, q.price, q.chg, q.type, weekly || undefined, q.session, q.source);
-      const msg = ['⚡ EXPRESS ALERT — OPENING PLAY', '', banner, ...lines].join('\\n');
-      await i.editReply(msg);
-    } catch (err) {
-      await i.editReply('Live feed unavailable — using structure only; lower confidence.');
-    }
+    try{
+      const text = i.options.getString('text')||'NVDA';
+      const list = detectTickers(text).slice(0,4);
+      const chunks = [];
+      for(const t of list){
+        const q = await getQuote(t);
+        const {head,core} = banner(t,q);
+        const w = (q.type==='EQUITY'||q.type==='ETF') ? await weeklyOptions(t,q.price).catch(()=>null):null;
+        const block = ['⚡ EXPRESS ALERT — OPENING PLAY','',head,...core,...optLines(w),'— — —','This is not financial advice. Do your own research.'];
+        chunks.push(block.join('\n'));
+      }
+      await i.editReply(chunks.join('\n\n'));
+    }catch(e){ await i.editReply('Live feed error — try again.'); }
   }
 
-  if (i.commandName === 'deep') {
+  if(i.commandName==='deep'){
     await i.deferReply();
-    let tkr = normalizeTicker(i.options.getString('ticker') || 'NVDA');
-    if (!validTicker(tkr)) { await i.editReply('Invalid ticker symbol.'); return; }
-    try {
-      const q = await getQuote(tkr);
-      const end = dayjs().tz(TZ); const start = end.subtract(60, 'day');
-      const hist = await yf2.default.historical(tkr, { period1: start.toDate(), period2: end.toDate(), interval: '1d' });
-      const candles = hist.slice(-30); const closes = candles.map(c => c.close);
-      const sma = (arr, n) => arr.slice(-n).reduce((a,b)=>a+b,0)/Math.min(n, arr.length);
-      const sma20 = sma(closes, 20), sma50 = sma(closes, 50);
-      const pdh = candles[candles.length-2]?.high; const pdl = candles[candles.length-2]?.low;
-      const trend = sma20 > sma50 ? 'Uptrend (20>50)' : 'Mixed/Down (20<=50)';
+    try{
+      const t = norm(i.options.getString('ticker')||'SPY');
+      const q = await getQuote(t);
+      const end = dayjs().tz(TZ), start=end.subtract(90,'day');
+      const hist = await yf2.default.historical(t,{period1:start.toDate(), period2:end.toDate(), interval:'1d'});
+      const last30 = hist.slice(-30);
+      const closes = last30.map(c=>c.close);
+      const sma=(a,n)=>a.slice(-n).reduce((x,y)=>x+y,0)/Math.min(n,a.length);
+      const sma20=sma(closes,20), sma50=sma(closes,50);
+      const pdh=last30.at(-2)?.high, pdl=last30.at(-2)?.low;
+      const trend = sma20>sma50? '🟢 Up (20>50)':'🟡 Mixed/Down (20<=50)';
       const lines = [
-        `DEEP DIVE 📚 — ${tkr} @ ${fmt(q.price)} (${q.chg>=0?'+':''}${fmt(q.chg)}%) — ${ts()}`,
-        `• Type: ${q.type} | Session: ${q.session}`,
+        `DEEP DIVE 📚 — ${t} @ ${fmt(q.price)} (${q.chg>=0?'+':''}${fmt(q.chg)}%) — ${ts()}`,
+        `• Type: ${q.type} | Session: ${q.session} | Source: ${q.source}${q.flag?` | ${q.flag}`:''}`,
         `• Trend: ${trend}`,
         `• PDH/PDL: ${fmt(pdh)}/${fmt(pdl)}`,
         `• SMA20/50: ${fmt(sma20)}/${fmt(sma50)}`,
-        `• Liquidity: watch PDH/PDL sweeps`,
+        `• Liquidity: watch PDH/PDL sweeps` ,
         `• Plan: buy dips > PDH; lose PDL → hedge`,
         `— — —`,
         `This is not financial advice. Do your own research.`
-      ].join('\\n');
+      ].join('\n');
       await i.editReply(lines);
-    } catch (err) {
-      await i.editReply('Deep Dive unavailable — data error.');
-    }
+    }catch{ await i.editReply('Deep Dive unavailable — data error.'); }
   }
 
-  if (i.commandName === 'health') {
+  if(i.commandName==='scalp'){
     await i.deferReply();
-    try {
-      const now = ts();
-      const sess = getSession();
+    const sym = norm(i.options.getString('symbol')||'BTC-USD');
+    try{
+      const q = await getQuote(sym);
+      const r = 0.006; // 0.6% bands
+      const s1=+(q.price*(1-r)).toFixed(2), s2=+(q.price*(1-2*r)).toFixed(2);
+      const t1=+(q.price*(1+r)).toFixed(2), t2=+(q.price*(1+2*r)).toFixed(2);
+      const txt = [
+        `CRYPTO SCALP ⚡ — ${sym} @ ${fmt(q.price)} (${q.chg>=0?'+':''}${fmt(q.chg)}%) — ${ts()}`,
+        `• Bias: ${q.chg>=0?'🟢':'🟡'} Range scalp via VWAP`,
+        `• Key S/R: ${s2} / ${s1} | ${t1} / ${t2}`,
+        `• 🚫 SL: below ${s2}`,
+        `• 🎯 ${t1} / ${t2}`,
+        `— — —`,
+        `This is not financial advice. Do your own research.`
+      ].join('\n');
+      await i.editReply(txt);
+    }catch{ await i.editReply('Scalp unavailable — data error.'); }
+  }
+
+  if(i.commandName==='flow'){
+    await i.deferReply();
+    const t = norm(i.options.getString('ticker'));
+    // Placeholder: wire your provider here (UnusualWhales, CheddarFlow, etc.)
+    await i.editReply(`OPTIONS FLOW 🔍 — ${t}\n• Provider not configured. Add API + code to enable.\n• Meanwhile, use /alert for live levels and /deep for HTF.`);
+  }
+
+  if(i.commandName==='health'){
+    await i.deferReply();
+    try{
       const spy = await yahooQuoteFull('SPY');
-      const polyOk = POLY ? 'present' : 'missing';
       const msg = [
-        `HEALTH ✅ — ${now}`,
-        `• Session (NY): ${sess}`,
+        `HEALTH ✅ — ${ts()}`,
+        `• Session (NY): ${getSession()}`,
         `• Yahoo: OK — SPY ${fmt(spy.price)} (${spy.chg>=0?'+':''}${fmt(spy.chg)}%)`,
-        `• Polygon key: ${polyOk}`,
+        `• Polygon key: ${POLY ? 'present' : 'missing'}`,
         `• TZ: ${TZ}`
-      ].join('\\n');
+      ].join('\n');
       await i.editReply(msg);
-    } catch (e) {
-      await i.editReply('HEALTH ❌ — check tokens, internet, or Yahoo rate limits.');
-    }
+    }catch{ await i.editReply('HEALTH ❌ — check network or rate limits.'); }
   }
 });
 
-registerCommands().then(() => client.login(process.env.DISCORD_TOKEN));
-
+register().then(()=>client.login(TOKEN));
