@@ -1,4 +1,4 @@
-// Chart Assassin — Discord Live Options Bot (SAFE v3.1)
+// Chart Assassin — Discord Live Options Bot (SAFE v3.2)
 // ---------------------------------------------------
 // Commands: /alert, /deep, /scalp, /flow (placeholder), /health
 // Env (Railway → Variables):
@@ -21,7 +21,7 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const POLY = process.env.POLYGON_KEY;
 const TZ = process.env.TZ || 'UTC';
 
-console.log('Boot: Chart Assassin v3.1 SAFE', new Date().toISOString(), 'TZ=', TZ);
+console.log('Boot: Chart Assassin v3.2 SAFE', new Date().toISOString(), 'TZ=', TZ);
 if (!TOKEN || !CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID — set in Railway → Variables.');
   process.exit(1);
@@ -49,25 +49,24 @@ function getSession(now = dayjs().tz('America/New_York')) {
 }
 
 // ---- Data: Quotes ---------------------------------------------------------
+// Yahoo quote — resilient: light endpoint first, rich fallback
 async function yahooQuoteFull(ticker) {
+  // Primary: simple quote (less rate-limited)
   try {
-    const q = await yf2.default.quoteSummary(ticker, { modules: ['price'] });
-    const p = q?.price;
-    if (!p) throw new Error('No price');
-    const price = p.regularMarketPrice ?? p.postMarketPrice ?? p.preMarketPrice;
-    const chg =
-      p.regularMarketChangePercent ??
-      p.postMarketChangePercent ??
-      p.preMarketChangePercent ??
-      0;
-    const type = p.quoteType || 'EQUITY';
-    return { price: Number(price), chg: Number(chg), type, source: 'Yahoo' };
-  } catch {
     const q = await yf2.default.quote(ticker);
     const price = q?.regularMarketPrice ?? q?.postMarketPrice ?? q?.preMarketPrice;
-    const chg = q?.regularMarketChangePercent ?? 0;
-    const type = q?.quoteType || 'EQUITY';
-    if (price == null) throw new Error('Yahoo fallback failed');
+    const chg   = q?.regularMarketChangePercent ?? 0;
+    const type  = q?.quoteType || 'EQUITY';
+    if (price == null) throw new Error('No price on quote');
+    return { price: Number(price), chg: Number(chg), type, source: 'Yahoo' };
+  } catch (e1) {
+    // Fallback: rich quoteSummary
+    const q = await yf2.default.quoteSummary(ticker, { modules: ['price'] });
+    const p = q?.price;
+    if (!p) throw new Error('No price on quoteSummary');
+    const price = p.regularMarketPrice ?? p.postMarketPrice ?? p.preMarketPrice;
+    const chg   = p.regularMarketChangePercent ?? p.postMarketChangePercent ?? p.preMarketChangePercent ?? 0;
+    const type  = p.quoteType || 'EQUITY';
     return { price: Number(price), chg: Number(chg), type, source: 'Yahoo (fallback)' };
   }
 }
@@ -208,14 +207,14 @@ async function registerCommands() {
   await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
 }
 
-// ✅ use the new event name so the warning disappears
+// use the new event to avoid deprecation
 client.on('clientReady', () => console.log(`Logged in as ${client.user.tag}`));
 
 // ---- interactions ---------------------------------------------------------
 function detectTickers(s) {
   const words = (s || '').toUpperCase().replace(/[^A-Z0-9.\-\s$]/g, ' ').split(/\s+/);
   const raw = words.map((w) => w.replace(/^\$/, '')).filter(Boolean);
-  const uniq = [...new Set(raw.filter((x) => /^[A-Z][A-Z0-9.\-]{0,10}(?:-USD)?$/.test(x)))];
+  const uniq = [...new Set(raw.filter(isTicker))];
   return uniq.length ? uniq : ['NVDA'];
 }
 
@@ -254,7 +253,7 @@ client.on('interactionCreate', async (i) => {
   if (i.commandName === 'deep') {
     await i.deferReply();
     try {
-      const t = (i.options.getString('ticker') || 'SPY').toUpperCase();
+      const t = norm(i.options.getString('ticker') || 'SPY');
       const q = await getQuote(t);
       const end = dayjs().tz(TZ);
       const start = end.subtract(90, 'day');
@@ -266,8 +265,8 @@ client.on('interactionCreate', async (i) => {
       const last30 = hist.slice(-30);
       const closes = last30.map((c) => c.close);
       const sma = (a, n) => a.slice(-n).reduce((x, y) => x + y, 0) / Math.min(n, a.length);
-      const sma20 = sma(closes, 20);
-      const sma50 = sma(closes, 50);
+      const sma20 = sma(closes, 20),
+        sma50 = sma(closes, 50);
       const pdh = last30.at(-2)?.high;
       const pdl = last30.at(-2)?.low;
       const trend = sma20 > sma50 ? '🟢 Up (20>50)' : '🟡 Mixed/Down (20<=50)';
@@ -291,14 +290,14 @@ client.on('interactionCreate', async (i) => {
 
   if (i.commandName === 'scalp') {
     await i.deferReply();
-    const sym = (i.options.getString('symbol') || 'BTC-USD').toUpperCase();
+    const sym = norm(i.options.getString('symbol') || 'BTC-USD');
     try {
       const q = await getQuote(sym);
       const r = 0.006;
-      const s1 = +(q.price * (1 - r)).toFixed(2);
-      const s2 = +(q.price * (1 - 2 * r)).toFixed(2);
-      const t1 = +(q.price * (1 + r)).toFixed(2);
-      const t2 = +(q.price * (1 + 2 * r)).toFixed(2);
+      const s1 = +(q.price * (1 - r)).toFixed(2),
+        s2 = +(q.price * (1 - 2 * r)).toFixed(2);
+      const t1 = +(q.price * (1 + r)).toFixed(2),
+        t2 = +(q.price * (1 + 2 * r)).toFixed(2);
       const txt = [
         `CRYPTO SCALP ⚡ — ${sym} @ ${fmt(q.price)} (${q.chg >= 0 ? '+' : ''}${fmt(q.chg)}%) — ${ts()}`,
         `• Bias: ${q.chg >= 0 ? '🟢' : '🟡'} Range scalp via VWAP`,
@@ -317,7 +316,7 @@ client.on('interactionCreate', async (i) => {
 
   if (i.commandName === 'flow') {
     await i.deferReply();
-    const t = (i.options.getString('ticker') || '').toUpperCase();
+    const t = norm(i.options.getString('ticker'));
     await i.editReply(
       `OPTIONS FLOW 🔍 — ${t}\n• Provider not configured. Add API + code to enable.\n• Meanwhile, use /alert for live levels and /deep for HTF.`
     );
@@ -325,19 +324,30 @@ client.on('interactionCreate', async (i) => {
 
   if (i.commandName === 'health') {
     await i.deferReply();
+    let yahooLine = '• Yahoo: unavailable (rate limited?)';
     try {
-      const spy = await yahooQuoteFull('SPY');
-      const msg = [
-        `HEALTH ✅ — ${ts()}`,
-        `• Session (NY): ${getSession()}`,
-        `• Yahoo: OK — SPY ${fmt(spy.price)} (${spy.chg >= 0 ? '+' : ''}${fmt(spy.chg)}%)`,
-        `• Polygon key: ${POLY ? 'present' : 'missing'}`,
-        `• TZ: ${TZ}`
-      ].join('\n');
-      await i.editReply(msg);
+      const spy = await yf2.default.quote('SPY');
+      const price = spy?.regularMarketPrice ?? spy?.postMarketPrice ?? spy?.preMarketPrice;
+      const chg   = spy?.regularMarketChangePercent ?? 0;
+      if (price != null) {
+        yahooLine = `• Yahoo: OK — SPY ${fmt(price)} (${chg >= 0 ? '+' : ''}${fmt(chg)}%)`;
+      }
     } catch (e) {
-      console.error('HEALTH error:', e?.message || e);
-      await i.editReply('HEALTH ❌ — check network or rate limits.');
+      console.error('HEALTH yahoo warn:', e?.message || e);
+    }
+
+    const msg = [
+      `HEALTH ✅ — ${ts()}`,
+      `• Session (NY): ${getSession()}`,
+      yahooLine,
+      `• Polygon key: ${POLY ? 'present' : 'missing'}`,
+      `• TZ: ${TZ}`
+    ].join('\n');
+
+    try { await i.editReply(msg); }
+    catch (e) {
+      console.error('HEALTH final error:', e?.message || e);
+      await i.editReply('HEALTH ❌ — transient error. Try again.');
     }
   }
 });
