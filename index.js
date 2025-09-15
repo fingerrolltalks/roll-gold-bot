@@ -1,18 +1,14 @@
-// Chart Assassin — Discord Live Options Bot (SAFE v3.5 AutoPilot + In-Discord Scheduler)
+// Chart Assassin — Discord Live Options Bot (SAFE v3.6 AutoPilot + In-Discord Scheduler)
 // -------------------------------------------------------------------------------------
-// NEW:
-// • /schedule_add  → add an auto-post job from Discord
-// • /schedule_list → list all jobs with IDs
-// • /schedule_remove → remove a job by ID
-// • Jobs persisted to schedules.json (simple file storage)
-// • Still includes your /alert, /deep, /scalp, /flow, /health
+// NEW in v3.6:
+// • More tolerant ticker parsing for /schedule_add (accepts "SPY, AAPL", "SPY AAPL", "$SPY,$AAPL", quotes, etc.)
+// • All previous features: /schedule_add, /schedule_list, /schedule_remove + persisted schedules.json
 //
 // ENV (Railway → Variables):
 //   DISCORD_TOKEN, DISCORD_CLIENT_ID, TZ=America/New_York
 //   DISCORD_CHANNEL_ID=<your Gold channel ID>
 //   POLYGON_KEY (optional), DISCREPANCY_BPS=50 (optional)
 
-// ------- Imports -----------------------------------------------------------
 import 'dotenv/config';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
 import axios from 'axios';
@@ -34,7 +30,7 @@ const TZSTR = process.env.TZ || 'UTC';
 const DISC_BPS = Number(process.env.DISCREPANCY_BPS ?? 50);
 const DEFAULT_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
 
-console.log('Boot: Chart Assassin v3.5', new Date().toISOString(), 'TZ=', TZSTR, 'BPS=', DISC_BPS);
+console.log('Boot: Chart Assassin v3.6', new Date().toISOString(), 'TZ=', TZSTR, 'BPS=', DISC_BPS);
 if (!TOKEN || !CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID.');
   process.exit(1);
@@ -237,9 +233,7 @@ function stopJob(id) {
   }
 }
 function restartAllJobs() {
-  // stop all
   for (const [id, job] of JOBS.entries()) { job.stop(); JOBS.delete(id); }
-  // start all
   for (const e of SCHEDULES) startJob(e);
 }
 
@@ -278,7 +272,7 @@ async function registerCommands() {
          .setRequired(true))
       .addStringOption(o =>
         o.setName('tickers')
-         .setDescription('Comma-separated tickers (max 4): e.g. "SPY, QQQ, NVDA, TSLA"')
+         .setDescription('Tickers (comma/space-separated, max 4): e.g. "SPY, QQQ, NVDA, TSLA"')
          .setRequired(true))
       .addChannelOption(o =>
         o.setName('channel')
@@ -345,9 +339,12 @@ client.on('interactionCreate', async (i) => {
     if (i.commandName === 'alert') {
       await i.deferReply({ ephemeral: false });
       const text = i.options.getString('text') || 'NVDA';
-      const words = (text || '').toUpperCase().replace(/[^A-Z0-9.\-\s$]/g, ' ').split(/\s+/);
-      const raw = words.map((w) => w.replace(/^\$/, '')).filter(Boolean);
-      const list = [...new Set(raw.filter(isTicker))].slice(0, 4);
+      const words = (text || '')
+        .replace(/[“”‘’"]/g, '')
+        .replace(/\$/g, '')
+        .toUpperCase()
+        .split(/[^A-Z0-9.\-]+/);
+      const list = [...new Set(words.filter(isTicker))].slice(0, 4);
       const tickers = list.length ? list : ['NVDA'];
 
       const chunks = [];
@@ -460,14 +457,22 @@ client.on('interactionCreate', async (i) => {
       const channelId = (chOpt?.id) || (DEFAULT_CHANNEL_ID || i.channelId);
 
       if (!cron.validate(cronStr)) {
-        await i.editReply(`❌ Invalid cron format: \`${cronStr}\`\nExamples:\n• \`0 9 * * 1-5\` → 9:00 AM Mon–Fri\n• \`30 15 * * 1-5\` → 3:30 PM Mon–Fri`);
+        await i.editReply(`❌ Invalid cron: \`${cronStr}\`\nExamples:\n• \`0 9 * * 1-5\` (9:00 AM Mon–Fri)\n• \`30 15 * * 1-5\` (3:30 PM Mon–Fri)\n• \`*/1 * * * *\` (every minute, testing)`);
         return;
       }
 
-      const rawTickers = tickStr.split(',').map(s => norm(s)).filter(Boolean);
+      // Tolerant ticker parser: removes quotes/$, splits on any non-ticker char, supports commas/spaces
+      const rawTickers = (tickStr || '')
+        .replace(/[“”‘’"]/g, '')   // remove fancy/normal quotes
+        .replace(/\$/g, '')        // remove $ signs
+        .toUpperCase()
+        .split(/[^A-Z0-9.\-]+/)    // split on commas, spaces, any non-ticker char
+        .filter(Boolean)
+        .map(s => norm(s));
+
       const unique = [...new Set(rawTickers.filter(isTicker))].slice(0, 4);
       if (!unique.length) {
-        await i.editReply('❌ No valid tickers found. Try like: `SPY, QQQ, NVDA, TSLA`');
+        await i.editReply('❌ No valid tickers found. Try: `SPY, QQQ, NVDA, TSLA`');
         return;
       }
 
@@ -522,7 +527,7 @@ client.once('ready', () => {
   loadSchedules();
   restartAllJobs();
 
-  // Optional baseline schedules if you want defaults on fresh deploys:
+  // Optional baseline schedules on fresh deploys (only if no file schedules yet)
   if (DEFAULT_CHANNEL_ID && !SCHEDULES.length) {
     const defaults = [
       { cron: '0 9 * * 1-5',  tickers: ['SPY','QQQ','NVDA','TSLA'], channelId: DEFAULT_CHANNEL_ID },
