@@ -262,7 +262,6 @@ async function registerCommands() {
       .setName('health')
       .setDescription('Health check: data + time + session'),
 
-    // NEW: schedule_add
     new SlashCommandBuilder()
       .setName('schedule_add')
       .setDescription('Add an auto-post schedule')
@@ -280,12 +279,10 @@ async function registerCommands() {
          .addChannelTypes(ChannelType.GuildText)
          .setRequired(false)),
 
-    // NEW: schedule_list
     new SlashCommandBuilder()
       .setName('schedule_list')
       .setDescription('List all auto-post schedules'),
 
-    // NEW: schedule_remove
     new SlashCommandBuilder()
       .setName('schedule_remove')
       .setDescription('Remove an auto-post schedule by ID')
@@ -296,7 +293,17 @@ async function registerCommands() {
   ].map(c => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  const GUILD_ID = process.env.DISCORD_GUILD_ID;
+
+  if (GUILD_ID) {
+    // Register commands to your server for instant updates
+    console.log('Registering GUILD commands for', GUILD_ID);
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+  } else {
+    // Fallback: global (slower to propagate)
+    console.log('Registering GLOBAL commands (no DISCORD_GUILD_ID set)');
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  }
 }
 
 // ------- Auto-post helper --------------------------------------------------
