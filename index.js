@@ -1,13 +1,20 @@
-// Chart Assassin — Discord Live Options Bot (SAFE v3.6 AutoPilot + In-Discord Scheduler)
-// -------------------------------------------------------------------------------------
-// NEW in v3.6:
-// • More tolerant ticker parsing for /schedule_add (accepts "SPY, AAPL", "SPY AAPL", "$SPY,$AAPL", quotes, etc.)
-// • All previous features: /schedule_add, /schedule_list, /schedule_remove + persisted schedules.json
+// Chart Assassin — Discord Live Options Bot
+// SAFE v3.7 (Guild Commands + Tolerant Tickers + Scheduler)
+// ---------------------------------------------------------
+// New in v3.7:
+// • Registers slash commands to your SERVER (fast refresh) if DISCORD_GUILD_ID is set
+// • Very tolerant ticker parsing (commas/spaces/$/quotes)
+// • In-Discord scheduler: /schedule_add, /schedule_list, /schedule_remove
+// • schedules.json persistence
 //
-// ENV (Railway → Variables):
-//   DISCORD_TOKEN, DISCORD_CLIENT_ID, TZ=America/New_York
-//   DISCORD_CHANNEL_ID=<your Gold channel ID>
-//   POLYGON_KEY (optional), DISCREPANCY_BPS=50 (optional)
+// Railway → Variables (required):
+//   DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, DISCORD_CHANNEL_ID
+// Optional:
+//   TZ=America/New_York, POLYGON_KEY, DISCREPANCY_BPS (default 50)
+//
+// Notes:
+// - If commands look "outdated", ensure DISCORD_GUILD_ID is your server's ID and that logs show "Registering GUILD commands".
+// - If Discord says "application did not respond", make sure the bot is online and logs show "Logged in as ...".
 
 import 'dotenv/config';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
@@ -22,21 +29,23 @@ import fs from 'fs';
 dayjs.extend(utc);
 dayjs.extend(tz);
 
-// ------- ENV & Boot Guards -------------------------------------------------
+// ---------- ENV ------------------------------------------------------------
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-const POLY = process.env.POLYGON_KEY;
-const TZSTR = process.env.TZ || 'UTC';
-const DISC_BPS = Number(process.env.DISCREPANCY_BPS ?? 50);
+const GUILD_ID = process.env.DISCORD_GUILD_ID || '';         // set this!
 const DEFAULT_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
+const TZSTR = process.env.TZ || 'UTC';
+const POLY = process.env.POLYGON_KEY;
+const DISC_BPS = Number(process.env.DISCREPANCY_BPS ?? 50);
 
-console.log('Boot: Chart Assassin v3.6', new Date().toISOString(), 'TZ=', TZSTR, 'BPS=', DISC_BPS);
 if (!TOKEN || !CLIENT_ID) {
-  console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID.');
+  console.error('❌ Missing DISCORD_TOKEN or DISCORD_CLIENT_ID');
   process.exit(1);
 }
 
-// ------- Small Utils -------------------------------------------------------
+console.log('Boot v3.7', { TZ: TZSTR, DISC_BPS, hasGUILD_ID: !!GUILD_ID, hasCHANNEL: !!DEFAULT_CHANNEL_ID });
+
+// ---------- Small utils ----------------------------------------------------
 const ts = () => dayjs().tz(TZSTR).format('MMM D, HH:mm z');
 const fmt = (n, d = 2) => Number(n).toFixed(d);
 const clean = (s) => (s || '').trim();
@@ -57,7 +66,7 @@ function getSession(now = dayjs().tz('America/New_York')) {
   return 'OFF';
 }
 
-// ------- Data: Quotes & Options -------------------------------------------
+// ---------- Data: Yahoo + Polygon -----------------------------------------
 async function yahooQuoteFull(ticker) {
   try {
     const q = await yf2.default.quote(ticker);
@@ -113,6 +122,7 @@ async function getQuote(ticker) {
   return { ...y, session: getSession(), alt: null, flag: '' };
 }
 
+// ---------- Options (weekly, ATM) -----------------------------------------
 function nextFriday(now = dayjs().tz(TZSTR)) {
   const add = ((5 - now.day()) + 7) % 7 || 7;
   return now.add(add, 'day').startOf('day');
@@ -147,7 +157,7 @@ async function weeklyOptions(ticker, spot) {
   }
 }
 
-// ------- Formatters --------------------------------------------------------
+// ---------- Text formatters ------------------------------------------------
 function banner(t, q) {
   const price = fmt(q.price);
   const pct = (q.chg >= 0 ? '+' : '') + fmt(q.chg) + '%';
@@ -184,13 +194,13 @@ function optLines(w) {
   ];
 }
 
-// ------- Discord Client ----------------------------------------------------
+// ---------- Discord client -------------------------------------------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// ------- Schedules Storage & Runtime Jobs ---------------------------------
+// ---------- Schedules storage/runtime -------------------------------------
 const SFILE = 'schedules.json';
-let SCHEDULES = [];           // [{id, cron, tickers:string[], channelId}]
-const JOBS = new Map();       // id -> cron job
+let SCHEDULES = [];      // [{id, cron, tickers:string[], channelId}]
+const JOBS = new Map();  // id -> cron job
 let NEXT_ID = 1;
 
 function loadSchedules() {
@@ -201,7 +211,7 @@ function loadSchedules() {
       if (Array.isArray(data)) {
         SCHEDULES = data;
         NEXT_ID = (Math.max(0, ...SCHEDULES.map(x => x.id || 0)) + 1) || 1;
-        console.log('Loaded schedules:', SCHEDULES.length);
+        console.log('Loaded schedules from file:', SCHEDULES.length);
       }
     }
   } catch (e) {
@@ -209,15 +219,12 @@ function loadSchedules() {
   }
 }
 function saveSchedules() {
-  try {
-    fs.writeFileSync(SFILE, JSON.stringify(SCHEDULES, null, 2));
-  } catch (e) {
-    console.error('saveSchedules error:', e?.message || e);
-  }
+  try { fs.writeFileSync(SFILE, JSON.stringify(SCHEDULES, null, 2)); }
+  catch (e) { console.error('saveSchedules error:', e?.message || e); }
 }
 function startJob(entry) {
   if (!cron.validate(entry.cron)) {
-    console.error('Invalid cron, skipping job id', entry.id, entry.cron);
+    console.error('Invalid cron, skip id', entry.id, entry.cron);
     return;
   }
   const job = cron.schedule(entry.cron, () => {
@@ -227,17 +234,14 @@ function startJob(entry) {
 }
 function stopJob(id) {
   const job = JOBS.get(id);
-  if (job) {
-    job.stop();
-    JOBS.delete(id);
-  }
+  if (job) { job.stop(); JOBS.delete(id); }
 }
 function restartAllJobs() {
   for (const [id, job] of JOBS.entries()) { job.stop(); JOBS.delete(id); }
   for (const e of SCHEDULES) startJob(e);
 }
 
-// ------- Slash Commands Registration --------------------------------------
+// ---------- Slash commands registration -----------------------------------
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
@@ -267,7 +271,7 @@ async function registerCommands() {
       .setDescription('Add an auto-post schedule')
       .addStringOption(o =>
         o.setName('cron')
-         .setDescription('Cron time (e.g. "0 9 * * 1-5" = 9:00 AM Mon-Fri)')
+         .setDescription('Cron like "0 9 * * 1-5" (9:00 AM Mon–Fri) or "*/1 * * * *" (every minute)')
          .setRequired(true))
       .addStringOption(o =>
         o.setName('tickers')
@@ -293,24 +297,21 @@ async function registerCommands() {
   ].map(c => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  const GUILD_ID = process.env.DISCORD_GUILD_ID;
 
   if (GUILD_ID) {
-    // Register commands to your server for instant updates
     console.log('Registering GUILD commands for', GUILD_ID);
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
   } else {
-    // Fallback: global (slower to propagate)
     console.log('Registering GLOBAL commands (no DISCORD_GUILD_ID set)');
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
   }
 }
 
-// ------- Auto-post helper --------------------------------------------------
+// ---------- Auto-post helper ----------------------------------------------
 async function postExpressAlert(tickers, channelId) {
   try {
     const channel = await client.channels.fetch(channelId);
-    const list = tickers.map(norm).slice(0, 4);
+    const list = (tickers || []).map(norm).slice(0, 4);
 
     const chunks = [];
     for (const t of list) {
@@ -331,18 +332,22 @@ async function postExpressAlert(tickers, channelId) {
       ];
       chunks.push(block.join('\n'));
     }
+    if (!chunks.length) return;
     await channel.send(chunks.join('\n\n'));
   } catch (e) {
     console.error('Scheduled post error:', e?.message || e);
   }
 }
 
-// ------- Interaction Handlers ---------------------------------------------
+// ---------- Interaction handlers ------------------------------------------
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
 
   try {
-    // ----- /alert
+    // Ensure we acknowledge fast
+    // (we individually defer in each command block below)
+
+    // /alert
     if (i.commandName === 'alert') {
       await i.deferReply({ ephemeral: false });
       const text = i.options.getString('text') || 'NVDA';
@@ -374,7 +379,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // ----- /deep
+    // /deep
     if (i.commandName === 'deep') {
       await i.deferReply({ ephemeral: false });
       const t = norm(i.options.getString('ticker') || 'SPY');
@@ -402,7 +407,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // ----- /scalp
+    // /scalp
     if (i.commandName === 'scalp') {
       await i.deferReply({ ephemeral: false });
       const sym = norm(i.options.getString('symbol') || 'BTC-USD');
@@ -423,7 +428,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // ----- /flow (placeholder)
+    // /flow (placeholder)
     if (i.commandName === 'flow') {
       await i.deferReply({ ephemeral: false });
       const t = norm(i.options.getString('ticker'));
@@ -431,7 +436,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // ----- /health
+    // /health
     if (i.commandName === 'health') {
       await i.deferReply({ ephemeral: false });
       let yahooLine = '• Yahoo: unavailable (rate limited?)';
@@ -452,9 +457,9 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // ===== NEW: SCHEDULER COMMANDS ========================================
+    // ===== Scheduler commands =====
 
-    // ----- /schedule_add
+    // /schedule_add
     if (i.commandName === 'schedule_add') {
       await i.deferReply({ ephemeral: true });
 
@@ -468,12 +473,12 @@ client.on('interactionCreate', async (i) => {
         return;
       }
 
-      // Tolerant ticker parser: removes quotes/$, splits on any non-ticker char, supports commas/spaces
+      // tolerant ticker parser: removes quotes/$, splits on any non-ticker char
       const rawTickers = (tickStr || '')
-        .replace(/[“”‘’"]/g, '')   // remove fancy/normal quotes
-        .replace(/\$/g, '')        // remove $ signs
+        .replace(/[“”‘’"]/g, '')
+        .replace(/\$/g, '')
         .toUpperCase()
-        .split(/[^A-Z0-9.\-]+/)    // split on commas, spaces, any non-ticker char
+        .split(/[^A-Z0-9.\-]+/)
         .filter(Boolean)
         .map(s => norm(s));
 
@@ -492,7 +497,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // ----- /schedule_list
+    // /schedule_list
     if (i.commandName === 'schedule_list') {
       await i.deferReply({ ephemeral: true });
       if (!SCHEDULES.length) {
@@ -504,7 +509,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // ----- /schedule_remove
+    // /schedule_remove
     if (i.commandName === 'schedule_remove') {
       await i.deferReply({ ephemeral: true });
       const id = i.options.getInteger('id');
@@ -526,15 +531,14 @@ client.on('interactionCreate', async (i) => {
   }
 });
 
-// ------- Startup -----------------------------------------------------------
+// ---------- Startup --------------------------------------------------------
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // Load file schedules and start them
   loadSchedules();
   restartAllJobs();
 
-  // Optional baseline schedules on fresh deploys (only if no file schedules yet)
+  // Optional: baseline schedules on clean boot if none exist and a default channel is provided
   if (DEFAULT_CHANNEL_ID && !SCHEDULES.length) {
     const defaults = [
       { cron: '0 9 * * 1-5',  tickers: ['SPY','QQQ','NVDA','TSLA'], channelId: DEFAULT_CHANNEL_ID },
@@ -552,14 +556,14 @@ client.once('ready', () => {
   }
 });
 
-// keep alive for worker envs
+// keep worker envs alive
 setInterval(() => {}, 60 * 1000);
 
-// error logging
+// errors
 process.on('uncaughtException', (err) => console.error('Uncaught:', err));
 process.on('unhandledRejection', (err) => console.error('Unhandled:', err));
 
-// register commands & login
+// register & login
 registerCommands()
   .then(() => client.login(TOKEN))
   .catch((e) => { console.error('Startup error:', e?.message || e); process.exit(1); });
