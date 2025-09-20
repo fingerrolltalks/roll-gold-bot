@@ -346,7 +346,6 @@ async function postExpressAlert(tickers, channelId) {
 }
 
 // ---------- Interaction handlers ------------------------------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
   try {
