@@ -1,4 +1,4 @@
-/ Chart Assassin — Discord Live Options Bot
+// Chart Assassin — Discord Live Options Bot
 // SAFE v3.9 (adds RVOL tag) + Compact Alerts + SL label + Mode + Best Contracts + Scheduler
 // ----------------------------------------------------------------------------------------
 // Required Railway Variables: DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, DISCORD_CHANNEL_ID
