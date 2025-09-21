@@ -1,8 +1,8 @@
 // Chart Assassin — Discord Live Options Bot
-// SAFE v3.9 (adds RVOL tag) + Compact Alerts + SL label + Mode + Best Contracts + Scheduler
-// ----------------------------------------------------------------------------------------
-// Required Railway Variables: DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, DISCORD_CHANNEL_ID
-// Optional: TZ=America/New_York, POLYGON_KEY, DISCREPANCY_BPS=50
+// SAFE v3.9 (RVOL + Compact Alerts + Scheduler + Low-cap scanner + Polygon discovery)
+// ----------------------------------------------------------------------------------
+// Required: DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_CHANNEL_ID
+// Optional: DISCORD_GUILD_ID, TZ=America/New_York, POLYGON_KEY, DISCREPANCY_BPS=50, LOWCAP_LIST
 
 import 'dotenv/config';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
@@ -110,12 +110,12 @@ function estimateRVOLFromQuote(raw, session = 'OFF') {
 
   if (session === 'RTH') {
     const mins = minutesSinceOpenNY();
-    const frac = clamp(mins / 390, 0.05, 1);  // at least 5% of day to avoid divide-by-small
+    const frac = clamp(mins / 390, 0.05, 1);
     const expectedSoFar = avg * frac;
     if (expectedSoFar <= 0) return null;
     return vol / expectedSoFar;
   }
-  // PRE/POST/OFF → coarse ratio
+  // PRE/POST/OFF → coarse
   return vol / avg;
 }
 
@@ -282,7 +282,14 @@ async function registerCommands() {
     new SlashCommandBuilder().setName('schedule_list').setDescription('List all auto-post schedules'),
     new SlashCommandBuilder().setName('schedule_remove')
       .setDescription('Remove an auto-post schedule by ID')
-      .addIntegerOption(o => o.setName('id').setDescription('Schedule ID (see /schedule_list)').setRequired(true))
+      .addIntegerOption(o => o.setName('id').setDescription('Schedule ID (see /schedule_list)').setRequired(true)),
+    // ---- NEW: low-cap scan
+    new SlashCommandBuilder()
+      .setName('lowscan')
+      .setDescription('Scan low-caps ($0.50–$7) by highest (pre)market volume + RVOL + float + news')
+      .addChannelOption(o =>
+        o.setName('channel').setDescription('Where to post (defaults to current channel)').addChannelTypes(ChannelType.GuildText).setRequired(false)
+      )
   ].map(c => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -345,7 +352,122 @@ async function postExpressAlert(tickers, channelId) {
   }
 }
 
-// ---------- Interaction handlers ------------------------------------------
+// ---------- Low-cap Scanner (price $0.50–$7, volume, RVOL, float, news) ----------
+const LOW_PRICE_MIN = 0.5, LOW_PRICE_MAX = 7.0;
+const LOW_TOP_N = 8; // how many to show
+const LOW_UNIVERSE = (process.env.LOWCAP_LIST || (
+  'GROM,COSM,CEI,SNTG,HILS,ATHE,RNXT,SNOA,VERB,TTOO,BBIG,SOUN,HUT,CLSK,MARA,RIOT,TLRY,FFIE,NVOS,BEAT,TOP,HOLO,PXMD,BNED,KULR,OTRK,NAOV,AGRX,AMC,GME,CVNA'
+)).split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+
+function humanNum(n){
+  if (!Number.isFinite(n)) return '—';
+  if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
+  if (n >= 1e6) return (n/1e6).toFixed(2)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
+  return String(n|0);
+}
+
+// Discover a larger universe from Polygon (actives + gainers). Falls back to seed list if no POLY.
+async function discoverUniverseFromPolygon(max = 150) {
+  if (!POLY) return LOW_UNIVERSE;
+  try {
+    const http = axios.create({ timeout: 6000 });
+    const urls = [
+      'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/active',
+      'https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers'
+    ];
+    const all = new Set();
+    for (const u of urls) {
+      const r = await http.get(u, { params: { apiKey: POLY } });
+      const list = r?.data?.tickers || r?.data?.results || [];
+      for (const row of list) {
+        const t = (row.ticker || row.T || '').toUpperCase();
+        if (t) all.add(t);
+        if (all.size >= max) break;
+      }
+      if (all.size >= max) break;
+    }
+    const arr = [...all].filter(isTicker);
+    return arr.length ? arr : LOW_UNIVERSE;
+  } catch (e) {
+    console.warn('discoverUniverseFromPolygon failed — using seed list:', e?.message || e);
+    return LOW_UNIVERSE;
+  }
+}
+
+// Try to fetch floatShares (or sharesOutstanding) from Yahoo; latest news via Polygon (if key present)
+async function fetchFloatAndNews(ticker){
+  let floatM = null, headline = null;
+  try {
+    const qs = await yf2.default.quoteSummary(ticker, { modules: ['defaultKeyStatistics'] });
+    const ks = qs?.defaultKeyStatistics || {};
+    const floatShares = ks.floatShares ?? ks.sharesOutstanding ?? null;
+    if (Number.isFinite(Number(floatShares))) floatM = Number(floatShares)/1e6;
+  } catch {}
+  if (POLY) {
+    try {
+      const r = await axios.get('https://api.polygon.io/v2/reference/news', {
+        params: { ticker, limit: 1, order: 'desc', apiKey: POLY },
+        timeout: 5000
+      });
+      headline = r?.data?.results?.[0]?.title || null;
+    } catch {}
+  }
+  return { floatM, headline };
+}
+
+async function scanLowCaps() {
+  const rows = [];
+  const universe = await discoverUniverseFromPolygon(180); // << expanded universe if POLY
+  for (const t of universe) {
+    try {
+      const q = await yahooQuoteFull(t);
+      const price = Number(q.price);
+      if (!Number.isFinite(price) || price < LOW_PRICE_MIN || price > LOW_PRICE_MAX) continue;
+
+      const vol = Number(q?.raw?.preMarketVolume ?? q?.raw?.regularMarketVolume ?? 0);
+      const rvol = estimateRVOLFromQuote(q.raw, q.session);
+      const { floatM, headline } = await fetchFloatAndNews(t);
+
+      rows.push({ t, price, chg: q.chg, vol, rvol: rvol || null, floatM, headline });
+    } catch {} // ignore per-ticker errors
+  }
+  rows.sort((a,b) => (b.vol - a.vol) || ((b.rvol||0) - (a.rvol||0)));
+  return rows.slice(0, LOW_TOP_N);
+}
+
+async function postLowcapScan(channelId){
+  try{
+    const ch = await client.channels.fetch(channelId);
+    const picks = await scanLowCaps();
+
+    if (!picks.length) {
+      await ch.send(`🧪 Low-cap scan: none in $${LOW_PRICE_MIN}–$${LOW_PRICE_MAX}. (${ts()})`);
+      return;
+    }
+
+    const out = [];
+    out.push(`🧪 **Low-Cap Scanner** — Top ${LOW_TOP_N} by volume ($${LOW_PRICE_MIN}–$${LOW_PRICE_MAX}) — ${ts()}`);
+    out.push(`*(Data: Yahoo; News: Polygon if available)*`);
+    for (const p of picks) {
+      const dir = p.chg >= 0 ? '🟢' : '🔴';
+      const parts = [
+        `**$${p.t}** ${dir} ${p.price.toFixed(2)} (${p.chg>=0?'+':''}${p.chg.toFixed(2)}%)`,
+        `Vol ${humanNum(p.vol)}`,
+        p.rvol ? `RVOL ${p.rvol.toFixed(1)}x` : `RVOL —`,
+        (p.floatM!=null) ? `Float ~${p.floatM.toFixed(1)}M` : `Float —`
+      ];
+      const line = '• ' + parts.join(' | ') + (p.headline ? `\n   📰 ${p.headline}` : '');
+      out.push(line);
+    }
+    out.push('⛔ Day-trading low-caps is high risk. This is not financial advice.');
+    await ch.send(out.join('\n'));
+  }catch(e){
+    console.error('Lowcap scan post error:', e?.message || e);
+  }
+}
+
+// ---------- Interactions ---------------------------------------------------
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
   try {
@@ -364,6 +486,7 @@ client.on('interactionCreate', async (i) => {
       await i.editReply(chunks.join('\n\n'));
       return;
     }
+
     if (i.commandName === 'deep') {
       await i.deferReply({ ephemeral: false });
       const t = norm(i.options.getString('ticker') || 'SPY');
@@ -387,6 +510,7 @@ client.on('interactionCreate', async (i) => {
       ].join('\n'));
       return;
     }
+
     if (i.commandName === 'scalp') {
       await i.deferReply({ ephemeral: false });
       const sym = norm(i.options.getString('symbol') || 'BTC-USD');
@@ -403,12 +527,14 @@ client.on('interactionCreate', async (i) => {
       ].join('\n'));
       return;
     }
+
     if (i.commandName === 'flow') {
       await i.deferReply({ ephemeral: false });
       const t = norm(i.options.getString('ticker'));
       await i.editReply(`OPTIONS FLOW 🔍 — ${t}\n• Provider not configured. Add API + code to enable.\n• Meanwhile, use /alert and /deep.`);
       return;
     }
+
     if (i.commandName === 'health') {
       await i.deferReply({ ephemeral: false });
       let yahooLine = '• Yahoo: unavailable (rate limited?)';
@@ -427,6 +553,16 @@ client.on('interactionCreate', async (i) => {
       ].join('\n'));
       return;
     }
+
+    if (i.commandName === 'lowscan') {
+      await i.deferReply({ ephemeral: true });
+      const chOpt = i.options.getChannel('channel');
+      const channelId = chOpt?.id || i.channelId;
+      await postLowcapScan(channelId);
+      await i.editReply(`✅ Low-cap scan posted to <#${channelId}>`);
+      return;
+    }
+
     // ===== Scheduler =====
     if (i.commandName === 'schedule_add') {
       await i.deferReply({ ephemeral: true });
@@ -471,12 +607,23 @@ client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   loadSchedules(); restartAllJobs();
 
+  // Auto low-cap scans (07:00 & 08:00 ET, Mon–Fri) to DEFAULT_CHANNEL_ID
+  if (DEFAULT_CHANNEL_ID) {
+    try {
+      cron.schedule('0 7 * * 1-5', () => postLowcapScan(DEFAULT_CHANNEL_ID), { timezone: TZSTR });
+      cron.schedule('0 8 * * 1-5', () => postLowcapScan(DEFAULT_CHANNEL_ID), { timezone: TZSTR });
+      console.log('📅 Low-cap scans scheduled for 07:00 & 08:00 ET (Mon–Fri).');
+    } catch (e) {
+      console.error('Low-cap schedule error:', e?.message || e);
+    }
+  }
+
+  // Optional baseline equity schedules (only if none exist)
   if (DEFAULT_CHANNEL_ID && !SCHEDULES.length) {
     const defaults = [
       { cron: '0 9 * * 1-5',  tickers: ['SPY','QQQ','NVDA','TSLA'], channelId: DEFAULT_CHANNEL_ID },
       { cron: '0 12 * * 1-5', tickers: ['SPY'],                     channelId: DEFAULT_CHANNEL_ID },
-      { cron: '30 15 * * 1-5',tickers: ['SPY','AAPL'],              channelId: DEFAULT_CHANNEL_ID },
-      { cron: '0 18 * * 0',   tickers: ['SPY','AAPL','NVDA','TSLA','AMZN','GOOGL','MSFT','META'], channelId: DEFAULT_CHANNEL_ID }
+      { cron: '30 15 * * 1-5',tickers: ['SPY','AAPL'],              channelId: DEFAULT_CHANNEL_ID }
     ];
     for (const d of defaults) { const entry = { id: NEXT_ID++, ...d }; SCHEDULES.push(entry); startJob(entry); }
     saveSchedules(); console.log('Baseline schedules created.');
