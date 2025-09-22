@@ -1,5 +1,6 @@
 // Chart Assassin — Discord Live Options Bot
-// SAFE v3.12 (compact alerts + scheduler + low-cap + gappers + runner ping)
+// SAFE v3.13 (compact alerts + scheduler + low-cap + gappers + runner ping)
+// Low-cap scan now posts as a clean embed (boxed look, inline "two-across" fields).
 // -----------------------------------------------------------------------------
 // Env (Railway → Variables):
 //   DISCORD_TOKEN, DISCORD_CLIENT_ID
@@ -11,7 +12,7 @@
 //   LOWCAP_LIST              (optional; comma/space list to override default universe)
 
 import 'dotenv/config';
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType, EmbedBuilder } from 'discord.js';
 import axios from 'axios';
 import * as yf2 from 'yahoo-finance2';
 import dayjs from 'dayjs';
@@ -32,11 +33,8 @@ const TZSTR = process.env.TZ || 'UTC';
 const POLY = process.env.POLYGON_KEY || '';
 const DISC_BPS = Number(process.env.DISCREPANCY_BPS ?? 50);
 
-if (!TOKEN || !CLIENT_ID) {
-  console.error('❌ Missing DISCORD_TOKEN or DISCORD_CLIENT_ID');
-  process.exit(1);
-}
-console.log('Boot v3.12', { TZ: TZSTR, DISC_BPS, GUILD_ID: !!GUILD_ID, DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID });
+if (!TOKEN || !CLIENT_ID) { console.error('❌ Missing DISCORD_TOKEN or DISCORD_CLIENT_ID'); process.exit(1); }
+console.log('Boot v3.13', { TZ: TZSTR, DISC_BPS, GUILD_ID: !!GUILD_ID, DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID });
 
 // ---------- Utils ----------------------------------------------------------
 const ts = () => dayjs().tz(TZSTR).format('MMM D, HH:mm z');
@@ -270,9 +268,7 @@ const DEFAULT_LOWCAP_UNIVERSE = [
 ];
 
 function lowcapUniverse() {
-  if (process.env.LOWCAP_LIST) {
-    return process.env.LOWCAP_LIST.split(/[,\s]+/).filter(Boolean).map(norm);
-  }
+  if (process.env.LOWCAP_LIST) return process.env.LOWCAP_LIST.split(/[,\s]+/).filter(Boolean).map(norm);
   return DEFAULT_LOWCAP_UNIVERSE;
 }
 
@@ -307,7 +303,6 @@ async function scanLowcapsTopN(n = 4) {
       const rvol = vol / Math.max(1, avg);
       if (rvol < 1.5) continue;
 
-      // Try a float hint (cheap): many low-caps aren't on Polygon; mark as unknown if not
       let floatDisp = '—';
       if (POLY) {
         try {
@@ -323,31 +318,48 @@ async function scanLowcapsTopN(n = 4) {
       out.push({ t, price, chg, vol, rvol, floatDisp, news });
     } catch {}
   }
-  // score: RVOL*2 + %chg
   out.forEach(x => x.score = 2*(x.rvol || 0) + (x.chg || 0));
   out.sort((a,b) => b.score - a.score);
   return out.slice(0, n);
 }
 
-function formatLowcapList(items, whenLabel, topN = 4) {
-  const head = `🧪 **Low-Cap Scanner — Top ${topN}**\n_$0.5–$7 | RVOL≥1.5× | Float≤? | News if available_\n${whenLabel}`;
-  if (!items.length) return `${head}\n_No tickers met filters._`;
-  const lines = [head];
+// ---- NEW: embed formatting for Low-cap Top 4 ------------------------------
+function buildLowcapEmbed(items, whenLabel, topN = 4) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🧪 Low-Cap Scanner — Top ${topN}`)
+    .setDescription('_$0.5–$7 | RVOL≥1.5× | Float≤? | News if available_')
+    .setFooter({ text: whenLabel })
+    .setColor(0x00D084); // teal/green
+
+  if (!items.length) {
+    embed.addFields({ name: 'No matches', value: 'No tickers met filters.', inline: false });
+    return embed;
+  }
+
   for (const a of items) {
     const dir = a.chg >= 0 ? '🟢' : '🔴';
-    lines.push(
-      `**$${a.t}**\n${dir} ${fmt(a.price)} (${a.chg>=0?'+':''}${fmt(a.chg)}%)\nVol ${fmt(a.vol/1e6,2)}M | RVOL ${fmt(a.rvol,1)}x | Float ${a.floatDisp}`
-    );
-    if (a.news) lines.push(`📰 ${a.news}`);
+    const name = `$${a.t} — ${dir} ${fmt(a.price)} (${a.chg>=0?'+':''}${fmt(a.chg)}%)`;
+    const valLines = [
+      `Vol **${fmt(a.vol/1e6,2)}M** | RVOL **${fmt(a.rvol,1)}×** | Float **${a.floatDisp}**`,
+      a.news ? `📰 ${a.news}` : '_No fresh headline_'
+    ];
+    embed.addFields({ name, value: valLines.join('\n'), inline: true });
   }
-  return lines.join('\n');
+
+  // If odd number, add a spacer to keep layout symmetric on some clients
+  if (items.length % 2 === 1) {
+    embed.addFields({ name: '\u200B', value: '\u200B', inline: true });
+  }
+
+  return embed;
 }
 
 async function postLowcapTopN(channelId, n = 4) {
   try {
     const ch = await client.channels.fetch(channelId);
     const items = await scanLowcapsTopN(n);
-    await ch.send(formatLowcapList(items, ts(), n));
+    const embed = buildLowcapEmbed(items, ts(), n);
+    await ch.send({ embeds: [embed] });
   } catch(e) { console.error('Lowcap post error:', e?.message||e); }
 }
 
@@ -360,8 +372,8 @@ async function scanGappersTopN(n = 6) {
       const q = await yahooQuoteFull(t);
       const price = q.price;
       const vol = Number(q.raw?.regularMarketVolume || 0);
-      if (!(price >= 0.5 && price <= 20)) continue;  // allow to $20
-      if (vol < 300_000) continue;                   // minimum liquidity
+      if (!(price >= 0.5 && price <= 20)) continue;
+      if (vol < 300_000) continue;
       rows.push({ t, price, chg: q.chg, vol });
     } catch {}
   }
@@ -369,19 +381,34 @@ async function scanGappersTopN(n = 6) {
   return rows.slice(0, n);
 }
 function formatGappersEmbed(items, whenLabel) {
-  const head = `🚀 **Gapper Scan — Top ${items.length} by %**\n_Min vol 300k | Price $0.5–$20_\n${whenLabel}`;
-  if (!items.length) return `${head}\n_No gappers meeting filters._`;
-  const lines = [head, ...items.map(x => {
+  const embed = new EmbedBuilder()
+    .setTitle(`🚀 Gapper Scan — Top ${items.length} by %`)
+    .setDescription('_Min vol 300k | Price $0.5–$20_')
+    .setFooter({ text: whenLabel })
+    .setColor(0x5865F2); // blurple
+
+  if (!items.length) {
+    embed.addFields({ name: 'No matches', value: 'No gappers meeting filters.', inline: false });
+    return embed;
+  }
+
+  for (const x of items) {
     const dir = x.chg >= 0 ? '🟢' : '🔴';
-    return `**$${x.t}** — ${dir} ${fmt(x.price)} (${x.chg>=0?'+':''}${fmt(x.chg)}%) | Vol ${fmt(x.vol/1e6,2)}M`;
-  })];
-  return lines.join('\n');
+    embed.addFields({
+      name: `$${x.t} — ${dir} ${fmt(x.price)} (${x.chg>=0?'+':''}${fmt(x.chg)}%)`,
+      value: `Vol **${fmt(x.vol/1e6,2)}M**`,
+      inline: true
+    });
+  }
+  if (items.length % 2 === 1) embed.addFields({ name: '\u200B', value: '\u200B', inline: true });
+  return embed;
 }
 async function postGapperScan(channelId, n = 6) {
   try {
     const ch = await client.channels.fetch(channelId);
     const items = await scanGappersTopN(n);
-    await ch.send(formatGappersEmbed(items, ts()));
+    const embed = formatGappersEmbed(items, ts());
+    await ch.send({ embeds: [embed] });
   } catch(e) { console.error('Gapper post error:', e?.message||e); }
 }
 
@@ -409,7 +436,6 @@ async function postRunnerPing(channelId) {
 
 // ---------- Build & send one compact alert --------------------------------
 async function buildCompactBlock(t, q) {
-  // quick context flags (trend + PMH/PDL)
   let ctx = {};
   try {
     const end = dayjs().tz(TZSTR), start = end.subtract(10, 'day');
@@ -424,9 +450,7 @@ async function buildCompactBlock(t, q) {
     ctx.belowPDL = y ? q.price < y.low : false;
     ctx.abovePMH = y ? q.price > y.high : false;
   } catch {}
-  // RVOL
   ctx.rvol = estimateRVOLFromQuote(q.raw, q.session) || null;
-  // daily context
   ctx.daily = await buildDailyContext(t, q.price, TZSTR);
 
   const lines = bannerCompact(t, q, ctx);
@@ -447,9 +471,7 @@ async function postExpressAlert(tickers, channelId) {
     }
     if (!chunks.length) return;
     await channel.send(chunks.join('\n\n'));
-  } catch (e) {
-    console.error('Scheduled post error:', e?.message || e);
-  }
+  } catch (e) { console.error('Scheduled post error:', e?.message || e); }
 }
 
 // ---------- Register slash commands ---------------------------------------
@@ -469,7 +491,6 @@ async function registerCommands() {
       .addStringOption(o => o.setName('ticker').setDescription('e.g., NVDA').setRequired(true)),
     new SlashCommandBuilder().setName('health').setDescription('Health check: data + time + session'),
 
-    // Scheduler commands
     new SlashCommandBuilder().setName('schedule_add')
       .setDescription('Add an auto-post schedule')
       .addStringOption(o => o.setName('cron').setDescription('Cron like 0 9 * * 1-5 (9:00 AM Mon–Fri) or */1 * * * * (every minute)').setRequired(true))
@@ -480,9 +501,8 @@ async function registerCommands() {
       .setDescription('Remove an auto-post schedule by ID')
       .addIntegerOption(o => o.setName('id').setDescription('Schedule ID (see /schedule_list)').setRequired(true)),
 
-    // Scanners
     new SlashCommandBuilder().setName('scan_lowcap')
-      .setDescription('Run the Low-Cap Top-4 scan now')
+      .setDescription('Run the Low-Cap Top-4 scan now (embed format)')
       .addChannelOption(o => o.setName('channel').setDescription('Channel to post in').addChannelTypes(ChannelType.GuildText).setRequired(false)),
     new SlashCommandBuilder().setName('scan_gappers')
       .setDescription('Run the Gapper scan now (Top % gainers w/ volume)')
@@ -648,7 +668,6 @@ client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   loadSchedules(); restartAllJobs();
 
-  // Baseline schedules for classic alerts (only if no user-created schedules yet)
   if (DEFAULT_CHANNEL_ID && !SCHEDULES.length) {
     const defaults = [
       { cron: '0 9 * * 1-5',  tickers: ['SPY','QQQ','NVDA','TSLA'], channelId: DEFAULT_CHANNEL_ID },
@@ -659,19 +678,17 @@ client.once('ready', () => {
     saveSchedules(); console.log('Baseline schedules created.');
   }
 
-  // Built-in autos (do NOT use file scheduler; these always run)
+  // Built-in autos (always on if DEFAULT_CHANNEL_ID set)
   if (DEFAULT_CHANNEL_ID) {
     const addLC = (cronStr) => cron.schedule(cronStr, () => postLowcapTopN(DEFAULT_CHANNEL_ID, 4), { timezone: TZSTR });
     const addGP = (cronStr) => cron.schedule(cronStr, () => postGapperScan(DEFAULT_CHANNEL_ID, 6), { timezone: TZSTR });
     const addRP = (cronStr) => cron.schedule(cronStr, () => postRunnerPing(DEFAULT_CHANNEL_ID),   { timezone: TZSTR });
 
-    // Low-caps & Gappers at 7/8/9 and 16:00 ET (Mon–Fri)
     addLC('0 7 * * 1-5'); addGP('0 7 * * 1-5');
     addLC('0 8 * * 1-5'); addGP('0 8 * * 1-5');
     addLC('0 9 * * 1-5'); addGP('0 9 * * 1-5');
     addLC('0 16 * * 1-5'); addGP('0 16 * * 1-5');
 
-    // A+ Runner pings
     addRP('15 8 * * 1-5');
     addRP('45 9 * * 1-5');
   }
@@ -687,8 +704,4 @@ process.on('unhandledRejection', (err) => console.error('Unhandled:', err));
 // register & login
 registerCommands()
   .catch(e => console.warn('Command registration threw (continuing):', e?.message || e))
-  .finally(() => {
-    client.login(TOKEN)
-      .then(() => console.log('Logged in OK'))
-      .catch(e => console.error('Login failed:', e?.message || e));
-  });
+  .finally(() => { client.login(TOKEN).then(() => console.log('Logged in OK')).catch(e => console.error('Login failed:', e?.message || e)); });
