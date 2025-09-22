@@ -1,11 +1,12 @@
 // Chart Assassin — Discord Live Options Bot
-// SAFE v3.9 (RVOL + Compact Alerts + Scheduler + Low-cap scanner + Polygon discovery)
+// SAFE v3.10 (RVOL + Compact Alerts + Scheduler + Low-cap scanner with Embeds)
+// Top N reduced to 4
 // ----------------------------------------------------------------------------------
 // Required: DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_CHANNEL_ID
 // Optional: DISCORD_GUILD_ID, TZ=America/New_York, POLYGON_KEY, DISCREPANCY_BPS=50, LOWCAP_LIST
 
 import 'dotenv/config';
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType, EmbedBuilder } from 'discord.js';
 import axios from 'axios';
 import * as yf2 from 'yahoo-finance2';
 import dayjs from 'dayjs';
@@ -23,11 +24,11 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GUILD_ID = process.env.DISCORD_GUILD_ID || '';
 const DEFAULT_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
 const TZSTR = process.env.TZ || 'UTC';
-const POLY = process.env.POLYGON_KEY;
+const POLY = process.env.POLYGON_KEY || '';
 const DISC_BPS = Number(process.env.DISCREPANCY_BPS ?? 50);
 
 if (!TOKEN || !CLIENT_ID) { console.error('❌ Missing DISCORD_TOKEN or DISCORD_CLIENT_ID'); process.exit(1); }
-console.log('Boot v3.9', { TZ: TZSTR, DISC_BPS, GUILD_ID: !!GUILD_ID, DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID });
+console.log('Boot v3.10', { TZ: TZSTR, DISC_BPS, GUILD_ID: !!GUILD_ID, DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID, POLY: !!POLY });
 
 // ---------- Utils ----------------------------------------------------------
 const ts = () => dayjs().tz(TZSTR).format('MMM D, HH:mm z');
@@ -283,7 +284,7 @@ async function registerCommands() {
     new SlashCommandBuilder().setName('schedule_remove')
       .setDescription('Remove an auto-post schedule by ID')
       .addIntegerOption(o => o.setName('id').setDescription('Schedule ID (see /schedule_list)').setRequired(true)),
-    // ---- NEW: low-cap scan
+    // ---- Low-cap scan
     new SlashCommandBuilder()
       .setName('lowscan')
       .setDescription('Scan low-caps ($0.50–$7) by highest (pre)market volume + RVOL + float + news')
@@ -303,21 +304,34 @@ async function registerCommands() {
 }
 
 // ---------- Build & send one compact alert --------------------------------
-async function buildCompactBlock(t, q) {
-  // quick context flags (trend + PMH/PDL)
-  let ctx = {};
+async function buildDailyContextQuick(ticker) {
   try {
     const end = dayjs().tz(TZSTR), start = end.subtract(10, 'day');
-    const hist = await yf2.default.historical(t, { period1: start.toDate(), period2: end.toDate(), interval: '1d' });
+    const hist = await yf2.default.historical(ticker, { period1: start.toDate(), period2: end.toDate(), interval: '1d' });
     const last = hist.slice(-3);
     const sma = (a, n) => a.slice(-n).reduce((x,y)=>x+y,0)/Math.min(n,a.length);
     const closes = last.map(c=>c.close);
     const ema9  = sma(closes, 9);
     const ema21 = sma(closes, 21) || sma(closes, 9);
-    ctx.trend = (Number.isFinite(ema9) && Number.isFinite(ema21)) ? (ema9 >= ema21 ? 'up' : 'down') : null;
     const y = last.at(-2);
-    ctx.belowPDL = y ? q.price < y.low : false;
-    ctx.abovePMH = y ? q.price > y.high : false;
+    return {
+      trend: (Number.isFinite(ema9) && Number.isFinite(ema21)) ? (ema9 >= ema21 ? 'up' : 'down') : null,
+      belowPDL: y ? undefined : false,
+      abovePMH: y ? undefined : false,
+      y
+    };
+  } catch { return {}; }
+}
+
+async function buildCompactBlock(t, q) {
+  // quick context flags
+  let ctx = {};
+  try {
+    ctx = await buildDailyContextQuick(t);
+    if (ctx.y) {
+      ctx.belowPDL = q.price < ctx.y.low;
+      ctx.abovePMH = q.price > ctx.y.high;
+    }
   } catch {}
 
   // RVOL (from Yahoo quote fields)
@@ -352,12 +366,17 @@ async function postExpressAlert(tickers, channelId) {
   }
 }
 
-// ---------- Low-cap Scanner (price $0.50–$7, volume, RVOL, float, news) ----------
+// ---------- Low-cap Scanner (price $0.50–$7) with Pro Filters + Embed -----
 const LOW_PRICE_MIN = 0.5, LOW_PRICE_MAX = 7.0;
-const LOW_TOP_N = 8; // how many to show
+const LOW_TOP_N = 4; // 👈 Top 4 (was 8)
 const LOW_UNIVERSE = (process.env.LOWCAP_LIST || (
   'GROM,COSM,CEI,SNTG,HILS,ATHE,RNXT,SNOA,VERB,TTOO,BBIG,SOUN,HUT,CLSK,MARA,RIOT,TLRY,FFIE,NVOS,BEAT,TOP,HOLO,PXMD,BNED,KULR,OTRK,NAOV,AGRX,AMC,GME,CVNA'
 )).split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+
+// ---- Pro filters (tweak to taste) ----
+const MIN_RVOL = 1.5;        // at least 1.5x normal volume
+const MAX_FLOAT_M = 50;      // max float ~50M shares
+const REQUIRE_NEWS = true;   // if Polygon is set, require a headline
 
 function humanNum(n){
   if (!Number.isFinite(n)) return '—';
@@ -367,7 +386,7 @@ function humanNum(n){
   return String(n|0);
 }
 
-// Discover a larger universe from Polygon (actives + gainers). Falls back to seed list if no POLY.
+// Discover more symbols (Polygon actives + gainers). Fallback to seed list.
 async function discoverUniverseFromPolygon(max = 150) {
   if (!POLY) return LOW_UNIVERSE;
   try {
@@ -395,7 +414,7 @@ async function discoverUniverseFromPolygon(max = 150) {
   }
 }
 
-// Try to fetch floatShares (or sharesOutstanding) from Yahoo; latest news via Polygon (if key present)
+// Fetch float (Yahoo) + latest news headline (Polygon)
 async function fetchFloatAndNews(ticker){
   let floatM = null, headline = null;
   try {
@@ -418,22 +437,34 @@ async function fetchFloatAndNews(ticker){
 
 async function scanLowCaps() {
   const rows = [];
-  const universe = await discoverUniverseFromPolygon(180); // << expanded universe if POLY
+  const universe = await discoverUniverseFromPolygon(180);
+
   for (const t of universe) {
     try {
       const q = await yahooQuoteFull(t);
       const price = Number(q.price);
       if (!Number.isFinite(price) || price < LOW_PRICE_MIN || price > LOW_PRICE_MAX) continue;
 
-      const vol = Number(q?.raw?.preMarketVolume ?? q?.raw?.regularMarketVolume ?? 0);
-      const rvol = estimateRVOLFromQuote(q.raw, q.session);
+      const vol  = Number(q?.raw?.preMarketVolume ?? q?.raw?.regularMarketVolume ?? 0);
+      const rvol = estimateRVOLFromQuote(q.raw, q.session) || 0;
       const { floatM, headline } = await fetchFloatAndNews(t);
 
-      rows.push({ t, price, chg: q.chg, vol, rvol: rvol || null, floatM, headline });
-    } catch {} // ignore per-ticker errors
+      // Pro filters
+      if (floatM != null && floatM > MAX_FLOAT_M) continue;
+      if (rvol && rvol < MIN_RVOL) continue;
+      if (REQUIRE_NEWS && POLY && !headline) continue;
+
+      rows.push({ t, price, chg: q.chg, vol, rvol, floatM, headline });
+    } catch { /* ignore per-ticker errors */ }
   }
-  rows.sort((a,b) => (b.vol - a.vol) || ((b.rvol||0) - (a.rvol||0)));
+
+  rows.sort((a,b) => (b.vol - a.vol) || (b.rvol - a.rvol));
   return rows.slice(0, LOW_TOP_N);
+}
+
+function truncate(str, max=140){
+  if (!str) return '';
+  return str.length <= max ? str : (str.slice(0, max-1) + '…');
 }
 
 async function postLowcapScan(channelId){
@@ -446,22 +477,25 @@ async function postLowcapScan(channelId){
       return;
     }
 
-    const out = [];
-    out.push(`🧪 **Low-Cap Scanner** — Top ${LOW_TOP_N} by volume ($${LOW_PRICE_MIN}–$${LOW_PRICE_MAX}) — ${ts()}`);
-    out.push(`*(Data: Yahoo; News: Polygon if available)*`);
+    // Build a compact embed to avoid wall of text
+    const embed = new EmbedBuilder()
+      .setTitle(`🧪 Low-Cap Scanner — Top ${LOW_TOP_N}`)
+      .setDescription(`$${LOW_PRICE_MIN}–$${LOW_PRICE_MAX} | RVOL≥${MIN_RVOL}x | Float≤${MAX_FLOAT_M}M ${REQUIRE_NEWS && POLY ? '| News✅' : ''}\n*Data: Yahoo; News: Polygon if available*\n${ts()}`)
+      .setColor(0x00D084);
+
     for (const p of picks) {
-      const dir = p.chg >= 0 ? '🟢' : '🔴';
-      const parts = [
-        `**$${p.t}** ${dir} ${p.price.toFixed(2)} (${p.chg>=0?'+':''}${p.chg.toFixed(2)}%)`,
-        `Vol ${humanNum(p.vol)}`,
-        p.rvol ? `RVOL ${p.rvol.toFixed(1)}x` : `RVOL —`,
-        (p.floatM!=null) ? `Float ~${p.floatM.toFixed(1)}M` : `Float —`
-      ];
-      const line = '• ' + parts.join(' | ') + (p.headline ? `\n   📰 ${p.headline}` : '');
-      out.push(line);
+      const dirEmoji = p.chg >= 0 ? '🟢' : '🔴';
+      const hot = (p.rvol >= 3 && p.floatM != null && p.floatM <= 20) ? ' 🔥' : '';
+      const name = `$${p.t}${hot}`;
+      const value = [
+        `${dirEmoji} **${p.price.toFixed(2)}** (${p.chg>=0?'+':''}${p.chg.toFixed(2)}%)`,
+        `Vol ${humanNum(p.vol)} | RVOL ${p.rvol ? p.rvol.toFixed(1)+'x' : '—'} | Float ${p.floatM!=null ? `~${p.floatM.toFixed(1)}M` : '—'}`,
+        p.headline ? `📰 ${truncate(p.headline, 120)}` : ''
+      ].filter(Boolean).join('\n');
+      embed.addFields({ name, value, inline: true });
     }
-    out.push('⛔ Day-trading low-caps is high risk. This is not financial advice.');
-    await ch.send(out.join('\n'));
+
+    await ch.send({ embeds: [embed] });
   }catch(e){
     console.error('Lowcap scan post error:', e?.message || e);
   }
