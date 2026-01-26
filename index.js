@@ -1,16 +1,17 @@
 // Chart Assassin — Discord Live Options Bot
 // SAFE v3.13 (compact alerts + scheduler + low-cap + gappers + runner ping)
+// -----------------------------------------------------------------------------
+// Env (Railway → Variables):
+//   DISCORD_TOKEN, DISCORD_CLIENT_ID
+//   DISCORD_GUILD_ID         (optional: faster command updates)
+//   DISCORD_CHANNEL_ID       (optional: default channel for auto posts)
+//   TZ=America/New_York      (recommended)
+//   POLYGON_KEY              (optional: for news + quote cross-check)
+//   DISCREPANCY_BPS=50       (optional; Yahoo vs Polygon tolerance)
+//   LOWCAP_LIST              (optional; comma/space list to override default universe)
 
 import 'dotenv/config';
-import {
-  Client,
-  GatewayIntentBits,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  ChannelType,
-  EmbedBuilder
-} from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType, EmbedBuilder } from 'discord.js';
 import axios from 'axios';
 import yahooFinance from 'yahoo-finance2';
 import dayjs from 'dayjs';
@@ -35,29 +36,20 @@ if (!TOKEN || !CLIENT_ID) {
   console.error('❌ Missing DISCORD_TOKEN or DISCORD_CLIENT_ID');
   process.exit(1);
 }
-console.log('Boot v3.13', {
-  TZ: TZSTR,
-  DISC_BPS,
-  GUILD_ID: !!GUILD_ID,
-  DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID
-});
+console.log('Boot v3.13', { TZ: TZSTR, DISC_BPS, GUILD_ID: !!GUILD_ID, DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID });
 
 // ---------- Utils ----------------------------------------------------------
 const ts = () => dayjs().tz(TZSTR).format('MMM D, HH:mm z');
 const fmt = (n, d = 2) => Number(n).toFixed(d);
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-
-// hard-safe string helpers (prevents your toUpperCase crash)
-const safeStr = (v) => (typeof v === 'string' ? v : (v == null ? '' : String(v)));
-const clean = (s) => safeStr(s).trim();
+const clean = (s) => (s ?? '').toString().trim();
 const norm = (s) => {
   const x = clean(s).toUpperCase();
   const map = { 'BRK.B': 'BRK-B', 'BRK.A': 'BRK-A' };
   return map[x] || x.replace(/\s+/g, '');
 };
-const isTicker = (s) => /^[A-Z][A-Z0-9.\-]{0,10}(?:-USD)?$/.test(clean(s).toUpperCase());
+const isTicker = (s) => /^[A-Z][A-Z0-9.\-]{0,10}(?:-USD)?$/.test(s);
 
-// market session helpers
 function getSession(now = dayjs().tz('America/New_York')) {
   const dow = now.day();
   const mins = now.hour() * 60 + now.minute();
@@ -68,46 +60,60 @@ function getSession(now = dayjs().tz('America/New_York')) {
   return 'OFF';
 }
 function minutesSinceOpenNY(now = dayjs().tz('America/New_York')) {
-  return Math.max(0, (now.hour() * 60 + now.minute()) - 570);
+  return Math.max(0, (now.hour() * 60 + now.minute()) - 570); // 9:30 = 570
 }
 
-// ---------- Quotes ---------------------------------------------------------
-async function yahooQuoteFull(ticker) {
-  const t = norm(ticker);
-
-  // Try quote first
+// Always reply (prevents “application did not respond”)
+async function safeRespond(i, content, ephemeral = false) {
   try {
-    const q = await yahooFinance.quote(t);
+    if (i.deferred || i.replied) return await i.editReply(content);
+    return await i.reply({ content, ephemeral });
+  } catch {}
+}
+
+// ---------- Yahoo (primary) ------------------------------------------------
+function looksRateLimited(err) {
+  const msg = (err?.message || '').toLowerCase();
+  return msg.includes('rate') || msg.includes('too many') || msg.includes('429');
+}
+
+async function yahooQuoteFull(ticker) {
+  try {
+    const q = await yahooFinance.quote(ticker);
     const price = q?.regularMarketPrice ?? q?.postMarketPrice ?? q?.preMarketPrice;
     const chg = q?.regularMarketChangePercent ?? 0;
     const type = q?.quoteType || 'EQUITY';
     if (price == null) throw new Error('No price on quote');
     return { price: Number(price), chg: Number(chg), type, source: 'Yahoo', raw: q };
   } catch (e) {
-    // Fallback to quoteSummary
-    const qs = await yahooFinance.quoteSummary(t, { modules: ['price', 'summaryDetail'] });
+    // Fallback module pull (sometimes works when quote fails)
+    const qs = await yahooFinance.quoteSummary(ticker, { modules: ['price', 'summaryDetail'] });
     const p = qs?.price;
     const s = qs?.summaryDetail || {};
-    if (!p) throw new Error('No price on quoteSummary');
+    if (!p) throw e;
+
     const price = p.regularMarketPrice ?? p.postMarketPrice ?? p.preMarketPrice;
     const chg =
       p.regularMarketChangePercent ??
       p.postMarketChangePercent ??
       p.preMarketChangePercent ??
       0;
+
     const type = p.quoteType || 'EQUITY';
     const raw = {
       regularMarketVolume: p.regularMarketVolume,
       averageDailyVolume3Month: s?.averageVolume || s?.averageVolume3Month
     };
+    if (price == null) throw e;
     return { price: Number(price), chg: Number(chg), type, source: 'Yahoo (fallback)', raw };
   }
 }
 
+// ---------- Polygon (optional cross-check) --------------------------------
 async function polygonQuote(ticker) {
   if (!POLY) return null;
-  const t = norm(ticker);
-  const http = axios.create({ timeout: 7000, headers: { 'User-Agent': 'ChartAssassinBot/Poly' } });
+  const http = axios.create({ timeout: 6000, headers: { 'User-Agent': 'ChartAssassinBot/Poly' } });
+
   const retry = async (fn, tries = 2) => {
     try { return await fn(); }
     catch (e) { if (tries <= 0) throw e; return retry(fn, tries - 1); }
@@ -115,14 +121,14 @@ async function polygonQuote(ticker) {
 
   try {
     const nb = await retry(() =>
-      http.get(`https://api.polygon.io/v2/last/nbbo/${t}`, { params: { apiKey: POLY } })
+      http.get(`https://api.polygon.io/v2/last/nbbo/${ticker}`, { params: { apiKey: POLY } })
     ).then(r => r.data?.results);
 
     const price = nb ? (nb.bid.price + nb.ask.price) / 2 : null;
     if (!price) return null;
 
     const prev = await retry(() =>
-      http.get(`https://api.polygon.io/v2/aggs/ticker/${t}/prev`, { params: { apiKey: POLY } })
+      http.get(`https://api.polygon.io/v2/aggs/ticker/${ticker}/prev`, { params: { apiKey: POLY } })
     ).then(r => r.data?.results?.[0]);
 
     const chg = prev ? ((price - prev.c) / prev.c) * 100 : 0;
@@ -135,22 +141,13 @@ async function polygonQuote(ticker) {
 async function getQuote(ticker) {
   const y = await yahooQuoteFull(ticker);
 
+  // If equity/ETF and polygon present, cross-check
   if (y.type === 'EQUITY' || y.type === 'ETF') {
     const p = await polygonQuote(ticker);
     if (p) {
       const diff = Math.abs((p.price - y.price) / y.price) * 100;
-      const flag = diff > (DISC_BPS / 100)
-        ? `⚠️ Discrepancy ${fmt(diff, 2)}% (Poly vs Y)`
-        : '';
-      return {
-        ...p,
-        type: y.type,
-        session: getSession(),
-        source: 'Polygon',
-        flag,
-        alt: `Yahoo ${fmt(y.price)}`,
-        raw: y.raw
-      };
+      const flag = diff > (DISC_BPS / 100) ? `⚠️ Discrepancy ${fmt(diff, 2)}% (Poly vs Y)` : '';
+      return { ...p, type: y.type, session: getSession(), source: 'Polygon', flag, alt: `Yahoo ${fmt(y.price)}`, raw: y.raw };
     }
   }
 
@@ -180,29 +177,25 @@ function nextFriday(now = dayjs().tz(TZSTR)) {
 }
 
 async function weeklyOptions(ticker, spot) {
-  const t = norm(ticker);
   try {
-    const meta = await yahooFinance.options(t);
+    const meta = await yahooFinance.options(ticker);
     const exps = (meta?.expirationDates || []).map((d) => dayjs.utc(d));
     if (!exps.length) return null;
 
     const target = nextFriday();
     const chosen = exps.find((d) => d.isAfter(target.subtract(1, 'minute'))) || exps.at(-1);
-    const chain = await yahooFinance.options(t, { date: chosen.toDate() });
 
+    const chain = await yahooFinance.options(ticker, { date: chosen.toDate() });
     const calls = chain?.calls || [];
     const puts = chain?.puts || [];
+
     const strikes = [...new Set([...calls, ...puts].map((o) => +o.strike))]
       .filter(Number.isFinite)
       .sort((a, b) => a - b);
 
     if (!strikes.length) return null;
 
-    const idx = strikes.reduce(
-      (best, s, i) => (Math.abs(s - spot) < Math.abs(strikes[best] - spot) ? i : best),
-      0
-    );
-
+    const idx = strikes.reduce((b, s, i) => (Math.abs(s - spot) < Math.abs(strikes[b] - spot) ? i : b), 0);
     const sATM = strikes[idx];
     const sPlus = strikes[Math.min(idx + 1, strikes.length - 1)];
     const sMinus = strikes[Math.max(idx - 1, 0)];
@@ -222,13 +215,12 @@ async function weeklyOptions(ticker, spot) {
   }
 }
 
-// ---------- Context / mode -------------------------------------------------
+// ---------- Daily context --------------------------------------------------
 async function buildDailyContext(ticker, spot, tzStr = TZSTR) {
-  const t = norm(ticker);
   try {
     const end = dayjs().tz(tzStr);
     const start = end.subtract(90, 'day');
-    const hist = await yahooFinance.historical(t, {
+    const hist = await yahooFinance.historical(ticker, {
       period1: start.toDate(),
       period2: end.toDate(),
       interval: '1d'
@@ -237,6 +229,7 @@ async function buildDailyContext(ticker, spot, tzStr = TZSTR) {
 
     const last = hist.slice(-60);
     const closes = last.map(c => c.close);
+
     const sma = (a, n) => {
       const k = Math.min(n, a.length);
       return k ? a.slice(-k).reduce((x, y) => x + y, 0) / k : NaN;
@@ -245,6 +238,7 @@ async function buildDailyContext(ticker, spot, tzStr = TZSTR) {
     const sma20 = sma(closes, 20);
     const sma50 = sma(closes, 50);
     const y = hist.at(-2);
+
     return { sma20, sma50, PDH: y?.high, PDL: y?.low };
   } catch {
     return {};
@@ -254,6 +248,7 @@ async function buildDailyContext(ticker, spot, tzStr = TZSTR) {
 function decideMode(q, ctx) {
   const nyMins = minutesSinceOpenNY();
   const isOpenWindow = q.session === 'RTH' && nyMins > 0 && nyMins <= 45;
+
   if (isOpenWindow && ctx?.trend) return ctx.trend === 'up' ? 'Opening Scalp (Calls)' : 'Opening Scalp (Puts)';
 
   const d = ctx?.daily || {};
@@ -263,6 +258,7 @@ function decideMode(q, ctx) {
     if (upTrend && q.price >= d.sma20 && (d.PDH ? q.price >= d.PDH : true)) return 'Swing Long';
     if (downTrend && q.price <= d.sma20 && (d.PDL ? q.price <= d.PDL : true)) return 'Swing Short';
   }
+
   return 'Neutral / Range';
 }
 
@@ -321,8 +317,8 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // ---------- Scheduler storage/runtime -------------------------------------
 const SFILE = 'schedules.json';
-let SCHEDULES = [];
-const JOBS = new Map();
+let SCHEDULES = [];      // [{id, cron, tickers:string[], channelId}]
+const JOBS = new Map();  // id -> cron job
 let NEXT_ID = 1;
 
 function loadSchedules() {
@@ -340,33 +336,19 @@ function loadSchedules() {
     console.error('loadSchedules error:', e?.message || e);
   }
 }
-
 function saveSchedules() {
-  try {
-    fs.writeFileSync(SFILE, JSON.stringify(SCHEDULES, null, 2));
-  } catch (e) {
-    console.error('saveSchedules error:', e?.message || e);
-  }
+  try { fs.writeFileSync(SFILE, JSON.stringify(SCHEDULES, null, 2)); }
+  catch (e) { console.error('saveSchedules error:', e?.message || e); }
 }
-
 function startJob(entry) {
-  if (!cron.validate(entry.cron)) {
-    console.error('Invalid cron, skip id', entry.id, entry.cron);
-    return;
-  }
-  const job = cron.schedule(
-    entry.cron,
-    () => { postExpressAlert(entry.tickers, entry.channelId); },
-    { timezone: TZSTR }
-  );
+  if (!cron.validate(entry.cron)) { console.error('Invalid cron, skip id', entry.id, entry.cron); return; }
+  const job = cron.schedule(entry.cron, () => { postExpressAlert(entry.tickers, entry.channelId); }, { timezone: TZSTR });
   JOBS.set(entry.id, job);
 }
-
 function stopJob(id) {
   const job = JOBS.get(id);
   if (job) { job.stop(); JOBS.delete(id); }
 }
-
 function restartAllJobs() {
   for (const [, job] of JOBS) job.stop();
   JOBS.clear();
@@ -380,19 +362,16 @@ const DEFAULT_LOWCAP_UNIVERSE = [
 ];
 
 function lowcapUniverse() {
-  if (process.env.LOWCAP_LIST) {
-    return process.env.LOWCAP_LIST.split(/[,\s]+/).filter(Boolean).map(norm);
-  }
+  if (process.env.LOWCAP_LIST) return process.env.LOWCAP_LIST.split(/[,\s]+/).filter(Boolean).map(norm);
   return DEFAULT_LOWCAP_UNIVERSE;
 }
 
 async function polygonNewsHeadline(ticker) {
   if (!POLY) return null;
-  const t = norm(ticker);
   try {
     const r = await axios.get('https://api.polygon.io/v2/reference/news', {
-      params: { ticker: t, limit: 1, sort: 'published_utc', order: 'desc', apiKey: POLY },
-      timeout: 7000,
+      params: { ticker, limit: 1, sort: 'published_utc', order: 'desc', apiKey: POLY },
+      timeout: 6000,
       headers: { 'User-Agent': 'ChartAssassinBot/News' }
     });
     const a = r.data?.results?.[0];
@@ -404,6 +383,7 @@ async function polygonNewsHeadline(ticker) {
   }
 }
 
+// scan top N low-caps by RVOL/float/news filters
 async function scanLowcapsTopN(n = 4) {
   const list = lowcapUniverse();
   const out = [];
@@ -425,8 +405,8 @@ async function scanLowcapsTopN(n = 4) {
       let floatDisp = '—';
       if (POLY) {
         try {
-          const info = await axios.get(`https://api.polygon.io/v3/reference/tickers/${norm(t)}`, {
-            params: { apiKey: POLY }, timeout: 7000
+          const info = await axios.get(`https://api.polygon.io/v3/reference/tickers/${t}`, {
+            params: { apiKey: POLY }, timeout: 6000
           }).then(r => r.data?.results);
 
           const floatShares = info?.weighted_shares_outstanding || info?.share_class_shares_outstanding;
@@ -435,11 +415,11 @@ async function scanLowcapsTopN(n = 4) {
       }
 
       const news = await polygonNewsHeadline(t);
-      out.push({ t: norm(t), price, chg, vol, rvol, floatDisp, news });
+      out.push({ t, price, chg, vol, rvol, floatDisp, news });
     } catch {}
   }
 
-  out.forEach(x => { x.score = 2 * (x.rvol || 0) + (x.chg || 0); });
+  out.forEach(x => x.score = 2 * (x.rvol || 0) + (x.chg || 0));
   out.sort((a, b) => b.score - a.score);
   return out.slice(0, n);
 }
@@ -466,9 +446,7 @@ function buildLowcapEmbed(items, whenLabel, topN = 4) {
     embed.addFields({ name, value: valLines.join('\n'), inline: true });
   }
 
-  if (items.length % 2 === 1) {
-    embed.addFields({ name: '\u200B', value: '\u200B', inline: true });
-  }
+  if (items.length % 2 === 1) embed.addFields({ name: '\u200B', value: '\u200B', inline: true });
   return embed;
 }
 
@@ -497,7 +475,7 @@ async function scanGappersTopN(n = 6) {
       if (!(price >= 0.5 && price <= 20)) continue;
       if (vol < 300_000) continue;
 
-      rows.push({ t: norm(t), price, chg: q.chg, vol });
+      rows.push({ t, price, chg: q.chg, vol });
     } catch {}
   }
 
@@ -570,25 +548,18 @@ async function postRunnerPing(channelId) {
 }
 
 // ---------- Build & send one compact alert --------------------------------
-async function buildCompactBlock(ticker, q) {
-  const t = norm(ticker);
-  const ctx = {};
+async function buildCompactBlock(t, q) {
+  let ctx = {};
 
   try {
-    const end = dayjs().tz(TZSTR);
-    const start = end.subtract(10, 'day');
-    const hist = await yahooFinance.historical(t, {
-      period1: start.toDate(),
-      period2: end.toDate(),
-      interval: '1d'
-    });
-
-    const last = (hist || []).slice(-3);
+    const end = dayjs().tz(TZSTR), start = end.subtract(10, 'day');
+    const hist = await yahooFinance.historical(t, { period1: start.toDate(), period2: end.toDate(), interval: '1d' });
+    const last = hist.slice(-3);
     const sma = (a, n) => a.slice(-n).reduce((x, y) => x + y, 0) / Math.min(n, a.length);
     const closes = last.map(c => c.close);
-
     const ema9 = sma(closes, 9);
     const ema21 = sma(closes, 21) || sma(closes, 9);
+
     ctx.trend = (Number.isFinite(ema9) && Number.isFinite(ema21)) ? (ema9 >= ema21 ? 'up' : 'down') : null;
 
     const y = last.at(-2);
@@ -607,9 +578,8 @@ async function buildCompactBlock(ticker, q) {
 }
 
 async function postExpressAlert(tickers, channelId) {
-  const ch = await client.channels.fetch(channelId);
+  const channel = await client.channels.fetch(channelId);
   const list = (tickers || []).map(norm).slice(0, 4);
-  if (!list.length) return;
 
   const chunks = [];
   for (const t of list) {
@@ -617,7 +587,9 @@ async function postExpressAlert(tickers, channelId) {
     const block = await buildCompactBlock(t, q);
     chunks.push(block.join('\n'));
   }
-  await ch.send(chunks.join('\n\n'));
+
+  if (!chunks.length) return;
+  await channel.send(chunks.join('\n\n'));
 }
 
 // ---------- Register slash commands ---------------------------------------
@@ -630,7 +602,7 @@ async function registerCommands() {
       .setDescription('DEEP DIVE: HTF context')
       .addStringOption(o => o.setName('ticker').setDescription('One ticker, e.g. SPY').setRequired(false)),
     new SlashCommandBuilder().setName('scalp')
-      .setDescription('CRYPTO SCALPS: BTC-USD / ETH-USD etc.')
+      .setDescription('CRYPTO SCALPS: BTC/ETH/SOL/XRP/ADA/DOGE quick levels')
       .addStringOption(o => o.setName('symbol').setDescription('e.g., BTC-USD').setRequired(false)),
     new SlashCommandBuilder().setName('flow')
       .setDescription('OPTIONS FLOW placeholder (configure provider later)')
@@ -648,19 +620,20 @@ async function registerCommands() {
       .addIntegerOption(o => o.setName('id').setDescription('Schedule ID (see /schedule_list)').setRequired(true)),
 
     new SlashCommandBuilder().setName('scan_lowcap')
-      .setDescription('Run the Low-Cap Top-4 scan now')
+      .setDescription('Run the Low-Cap Top-4 scan now (embed format)')
       .addChannelOption(o => o.setName('channel').setDescription('Channel to post in').addChannelTypes(ChannelType.GuildText).setRequired(false)),
     new SlashCommandBuilder().setName('scan_gappers')
-      .setDescription('Run the Gapper scan now')
+      .setDescription('Run the Gapper scan now (Top % gainers w/ volume)')
       .addChannelOption(o => o.setName('channel').setDescription('Channel to post in').addChannelTypes(ChannelType.GuildText).setRequired(false)),
   ].map(c => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(TOKEN);
+  const body = { body: commands };
 
   if (GUILD_ID) {
     try {
       console.log('Registering GUILD commands for', GUILD_ID);
-      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), body);
       console.log('GUILD commands registered.');
       return;
     } catch (e) {
@@ -668,34 +641,25 @@ async function registerCommands() {
     }
   }
 
-  console.log('Registering GLOBAL commands…');
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-  console.log('GLOBAL commands registered.');
+  try {
+    console.log('Registering GLOBAL commands…');
+    await rest.put(Routes.applicationCommands(CLIENT_ID), body);
+    console.log('GLOBAL commands registered.');
+  } catch (e) {
+    console.error('Global registration failed:', e?.status || '', e?.message || e);
+  }
 }
 
 // ---------- Interaction handlers ------------------------------------------
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
 
-  const safeReply = async (content, ephemeral = false) => {
-    try {
-      if (i.deferred || i.replied) return await i.editReply({ content });
-      return await i.reply({ content, ephemeral });
-    } catch {}
-  };
-
   try {
     if (i.commandName === 'alert') {
       await i.deferReply({ ephemeral: false });
 
-      const text = safeStr(i.options.getString('text') || 'NVDA');
-      const words = text
-        .replace(/[“”‘’"]/g, '')
-        .replace(/\$/g, '')
-        .toUpperCase()
-        .split(/[^A-Z0-9.\-]+/)
-        .filter(Boolean);
-
+      const text = i.options.getString('text') || 'NVDA';
+      const words = clean(text).replace(/[“”‘’"]/g, '').replace(/\$/g, '').toUpperCase().split(/[^A-Z0-9.\-]+/);
       const list = [...new Set(words.filter(isTicker))].slice(0, 4);
       const tickers = list.length ? list : ['NVDA'];
 
@@ -706,7 +670,7 @@ client.on('interactionCreate', async (i) => {
         chunks.push(block.join('\n'));
       }
 
-      await safeReply(chunks.join('\n\n'));
+      await i.editReply(chunks.join('\n\n'));
       return;
     }
 
@@ -716,31 +680,24 @@ client.on('interactionCreate', async (i) => {
       const t = norm(i.options.getString('ticker') || 'SPY');
       const q = await getQuote(t);
 
-      const end = dayjs().tz(TZSTR);
-      const start = end.subtract(90, 'day');
-      const hist = await yahooFinance.historical(t, {
-        period1: start.toDate(),
-        period2: end.toDate(),
-        interval: '1d'
-      });
+      const end = dayjs().tz(TZSTR), start = end.subtract(90, 'day');
+      const hist = await yahooFinance.historical(t, { period1: start.toDate(), period2: end.toDate(), interval: '1d' });
 
-      const last30 = (hist || []).slice(-30);
+      const last30 = hist.slice(-30);
       const closes = last30.map(c => c.close);
       const sma = (a, n) => a.slice(-n).reduce((x, y) => x + y, 0) / Math.min(n, a.length);
+      const sma20 = sma(closes, 20), sma50 = sma(closes, 50);
 
-      const sma20 = sma(closes, 20);
-      const sma50 = sma(closes, 50);
-      const pdh = last30.at(-2)?.high;
-      const pdl = last30.at(-2)?.low;
-
+      const pdh = last30.at(-2)?.high, pdl = last30.at(-2)?.low;
       const trend = sma20 > sma50 ? '🟢 Up (20>50)' : '🟡 Mixed/Down (20<=50)';
 
-      await safeReply([
+      await i.editReply([
         `DEEP DIVE 📚 — ${t} @ ${fmt(q.price)} (${q.chg >= 0 ? '+' : ''}${fmt(q.chg)}%) — ${ts()}`,
         `• Type: ${q.type} | Session: ${q.session} | Source: ${q.source}${q.flag ? ` | ${q.flag}` : ''}`,
         `• Trend: ${trend}`,
         `• PDH/PDL: ${fmt(pdh)}/${fmt(pdl)}`,
         `• SMA20/50: ${fmt(sma20)}/${fmt(sma50)}`,
+        `• Liquidity: watch PDH/PDL sweeps`,
         `• Plan: buy dips > PDH; lose PDL → hedge`
       ].join('\n'));
       return;
@@ -758,7 +715,7 @@ client.on('interactionCreate', async (i) => {
       const t1 = +(q.price * (1 + r)).toFixed(2);
       const t2 = +(q.price * (1 + 2 * r)).toFixed(2);
 
-      await safeReply([
+      await i.editReply([
         `CRYPTO SCALP ⚡ — ${sym} @ ${fmt(q.price)} (${q.chg >= 0 ? '+' : ''}${fmt(q.chg)}%) — ${ts()}`,
         `• Bias: ${q.chg >= 0 ? '🟢' : '🟡'} Range scalp via VWAP`,
         `• Key S/R: ${s2} / ${s1} | ${t1} / ${t2}`,
@@ -771,7 +728,7 @@ client.on('interactionCreate', async (i) => {
     if (i.commandName === 'flow') {
       await i.deferReply({ ephemeral: false });
       const t = norm(i.options.getString('ticker'));
-      await safeReply(`OPTIONS FLOW 🔍 — ${t}\n• Provider not configured. Use /alert and /deep.`);
+      await i.editReply(`OPTIONS FLOW 🔍 — ${t}\n• Provider not configured. Add API + code to enable.\n• Meanwhile, use /alert and /deep.`);
       return;
     }
 
@@ -786,7 +743,7 @@ client.on('interactionCreate', async (i) => {
         if (price != null) yahooLine = `• Yahoo: OK — SPY ${fmt(price)} (${chg >= 0 ? '+' : ''}${fmt(chg)}%)`;
       } catch {}
 
-      await safeReply([
+      await i.editReply([
         `HEALTH ✅ — ${ts()}`,
         `• Session (NY): ${getSession()}`,
         yahooLine,
@@ -796,20 +753,21 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
+    // ===== Scheduler =====
     if (i.commandName === 'schedule_add') {
       await i.deferReply({ ephemeral: true });
 
-      const cronStr = safeStr(i.options.getString('cron'));
-      const tickStr = safeStr(i.options.getString('tickers'));
+      const cronStr = i.options.getString('cron');
+      const tickStr = i.options.getString('tickers');
       const chOpt = i.options.getChannel('channel');
       const channelId = (chOpt?.id) || (DEFAULT_CHANNEL_ID || i.channelId);
 
       if (!cron.validate(cronStr)) {
-        await safeReply(`❌ Invalid cron: ${cronStr}\nExamples:\n• 0 9 * * 1-5\n• 30 15 * * 1-5\n• */1 * * * * (testing)`, true);
+        await i.editReply(`❌ Invalid cron: ${cronStr}\nExamples:\n• 0 9 * * 1-5\n• 30 15 * * 1-5\n• */1 * * * * (testing)`);
         return;
       }
 
-      const rawTickers = tickStr
+      const rawTickers = clean(tickStr)
         .replace(/[“”‘’"]/g, '')
         .replace(/\$/g, '')
         .toUpperCase()
@@ -818,51 +776,41 @@ client.on('interactionCreate', async (i) => {
         .map(norm);
 
       const unique = [...new Set(rawTickers.filter(isTicker))].slice(0, 4);
-      if (!unique.length) {
-        await safeReply('❌ No valid tickers found. Try: SPY, QQQ, NVDA, TSLA', true);
-        return;
-      }
+      if (!unique.length) { await i.editReply('❌ No valid tickers found. Try: SPY, QQQ, NVDA, TSLA'); return; }
 
       const entry = { id: NEXT_ID++, cron: cronStr, tickers: unique, channelId };
-      SCHEDULES.push(entry);
-      saveSchedules();
-      startJob(entry);
+      SCHEDULES.push(entry); saveSchedules(); startJob(entry);
 
-      await safeReply(
-        `✅ Added schedule #${entry.id}\n• Cron: ${entry.cron}\n• Tickers: ${entry.tickers.join(', ')}\n• Channel: <#${entry.channelId}>`,
-        true
-      );
+      await i.editReply(`✅ Added schedule #${entry.id}\n• Cron: ${entry.cron}\n• Tickers: ${entry.tickers.join(', ')}\n• Channel: <#${entry.channelId}>`);
       return;
     }
 
     if (i.commandName === 'schedule_list') {
       await i.deferReply({ ephemeral: true });
-      if (!SCHEDULES.length) { await safeReply('No schedules yet. Add one with /schedule_add.', true); return; }
-      await safeReply(SCHEDULES.map(e => `#${e.id} — ${e.cron} → [${e.tickers.join(', ')}] → <#${e.channelId}>`).join('\n'), true);
+      if (!SCHEDULES.length) { await i.editReply('No schedules yet. Add one with /schedule_add.'); return; }
+      await i.editReply(SCHEDULES.map(e => `#${e.id} — ${e.cron} → [${e.tickers.join(', ')}] → <#${e.channelId}>`).join('\n'));
       return;
     }
 
     if (i.commandName === 'schedule_remove') {
       await i.deferReply({ ephemeral: true });
-
       const id = i.options.getInteger('id');
       const idx = SCHEDULES.findIndex(e => e.id === id);
-      if (idx === -1) { await safeReply(`❌ Schedule #${id} not found.`, true); return; }
-
+      if (idx === -1) { await i.editReply(`❌ Schedule #${id} not found.`); return; }
       stopJob(id);
       const removed = SCHEDULES.splice(idx, 1)[0];
       saveSchedules();
-
-      await safeReply(`🗑️ Removed schedule #${id}: ${removed.cron} [${removed.tickers.join(', ')}]`, true);
+      await i.editReply(`🗑️ Removed schedule #${id}: ${removed.cron} [${removed.tickers.join(', ')}]`);
       return;
     }
 
+    // ===== Scanners (manual) =====
     if (i.commandName === 'scan_lowcap') {
       await i.deferReply({ ephemeral: false });
       const chOpt = i.options.getChannel('channel');
       const channelId = (chOpt?.id) || (DEFAULT_CHANNEL_ID || i.channelId);
       await postLowcapTopN(channelId, 4);
-      await safeReply(`✅ Low-cap Top 4 posted in <#${channelId}>`);
+      await i.editReply(`✅ Low-cap Top 4 posted in <#${channelId}>`);
       return;
     }
 
@@ -871,18 +819,26 @@ client.on('interactionCreate', async (i) => {
       const chOpt = i.options.getChannel('channel');
       const channelId = (chOpt?.id) || (DEFAULT_CHANNEL_ID || i.channelId);
       await postGapperScan(channelId, 6);
-      await safeReply(`✅ Gapper scan posted in <#${channelId}>`);
+      await i.editReply(`✅ Gapper scan posted in <#${channelId}>`);
       return;
     }
+
   } catch (e) {
     console.error('interaction error:', e?.message || e);
-    await safeReply('❌ Data provider error. Try again in 30–60s.');
+
+    const msg =
+      looksRateLimited(e)
+        ? '❌ Yahoo is rate-limiting right now. Try again in 30–90 seconds.'
+        : '❌ Data provider error. Try again in 30–60 seconds.';
+
+    await safeRespond(i, msg, true);
   }
 });
 
 // ---------- Startup --------------------------------------------------------
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
+
   loadSchedules();
   restartAllJobs();
 
@@ -916,7 +872,7 @@ client.once('ready', () => {
   }
 });
 
-// keep alive
+// keep worker envs alive
 setInterval(() => {}, 60 * 1000);
 
 // errors
