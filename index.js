@@ -1,8 +1,9 @@
 // Chart Assassin — Discord Live Options Bot
-// SAFE v3.14 (Polygon-first quotes + Yahoo fallback + hardening)
-// Fixes: Yahoo rate-limit breaks, null toUpperCase crash, bad import usage, DISC_BPS NaN
+// SAFE v3.14-P (full file, paste-all)
+// Polygon-first quotes + Yahoo fallback + hardening + null-safe parsing
+// Fixes: Yahoo rate-limit pain, null toUpperCase crash, DISC_BPS NaN, provider errors won't crash bot
 // -----------------------------------------------------------------------------
-// Env (Railway → Variables):
+// Env (Railway / Render / Docker):
 //   DISCORD_TOKEN, DISCORD_CLIENT_ID
 //   DISCORD_GUILD_ID         (optional: faster command updates)
 //   DISCORD_CHANNEL_ID       (optional: default channel for auto posts)
@@ -47,7 +48,7 @@ if (!TOKEN || !CLIENT_ID) {
   process.exit(1);
 }
 
-console.log('Boot v3.14', {
+console.log('Boot v3.14-P', {
   TZ: TZSTR,
   DISC_BPS,
   GUILD_ID: !!GUILD_ID,
@@ -61,7 +62,6 @@ try {
     queue: { concurrency: 1, timeout: 15000 },
     got: {
       headers: {
-        // realistic UA helps avoid some “blocked” HTML responses
         'user-agent':
           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36'
       }
@@ -74,19 +74,19 @@ const ts = () => dayjs().tz(TZSTR).format('MMM D, HH:mm z');
 const fmt = (n, d = 2) => Number(n).toFixed(d);
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 
-const clean = (s) => {
-  if (s == null) return '';
-  if (typeof s === 'string') return s.trim();
-  return String(s).trim();
-};
+// always-safe string helpers (prevents null/undefined crashes)
+const S = (v, fallback = '') => (typeof v === 'string' ? v : v == null ? fallback : String(v));
+const U = (v) => S(v).trim().toUpperCase();
+
+const clean = (s) => S(s).trim();
 
 const norm = (s) => {
-  const x = clean(s).toUpperCase();
+  const x = U(s);
   const map = { 'BRK.B': 'BRK-B', 'BRK.A': 'BRK-A' };
   return (map[x] || x).replace(/\s+/g, '');
 };
 
-const isTicker = (s) => /^[A-Z][A-Z0-9.\-]{0,10}(?:-USD)?$/.test(clean(s).toUpperCase());
+const isTicker = (v) => /^[A-Z][A-Z0-9.\-]{0,10}(?:-USD)?$/.test(U(v));
 
 function getSession(now = dayjs().tz('America/New_York')) {
   const dow = now.day();
@@ -99,7 +99,7 @@ function getSession(now = dayjs().tz('America/New_York')) {
 }
 
 function minutesSinceOpenNY(now = dayjs().tz('America/New_York')) {
-  return Math.max(0, (now.hour() * 60 + now.minute()) - 570); // 9:30 = 570
+  return Math.max(0, now.hour() * 60 + now.minute() - 570); // 9:30 = 570
 }
 
 // ---------- HTTP -----------------------------------------------------------
@@ -108,12 +108,16 @@ const http = axios.create({
   headers: { 'User-Agent': 'ChartAssassinBot/1.0' }
 });
 
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function retry(fn, tries = 2) {
   try {
     return await fn();
   } catch (e) {
     if (tries <= 0) throw e;
-    await new Promise((r) => setTimeout(r, 450));
+    await sleep(450);
     return retry(fn, tries - 1);
   }
 }
@@ -122,7 +126,7 @@ async function retry(fn, tries = 2) {
 async function polygonLastPrice(ticker) {
   if (!POLY) return null;
 
-  // Use NBBO mid if possible, else last trade
+  // NBBO mid first, else last trade
   try {
     const nb = await retry(() =>
       http.get(`https://api.polygon.io/v2/last/nbbo/${ticker}`, { params: { apiKey: POLY } })
@@ -168,7 +172,6 @@ async function polygonTodayAgg(ticker) {
     ).then((r) => r.data?.results?.[0]);
 
     if (!d) return null;
-    // if market closed, this may still exist as the last session day if called after close
     const close = d.c ?? d.o;
     if (!close) return null;
     return { price: Number(close), volume: Number(d.v || 0) };
@@ -199,54 +202,40 @@ async function polygonQuote(ticker) {
 
 // ---------- Yahoo (fallback + options/historical) --------------------------
 function isYahooRateLimitish(e) {
-  const m = String(e?.message || e || '');
+  const m = String(e?.message || e || '').toLowerCase();
   return (
-    m.includes('Unexpected token') ||
+    m.includes('unexpected token') ||
     m.includes('429') ||
-    m.toLowerCase().includes('too many') ||
-    m.toLowerCase().includes('rate') ||
-    m.toLowerCase().includes('forbidden') ||
-    m.toLowerCase().includes('blocked')
+    m.includes('too many') ||
+    m.includes('rate') ||
+    m.includes('forbidden') ||
+    m.includes('blocked')
   );
 }
 
 async function yahooQuoteFull(ticker) {
-  // Keep this lightweight; it WILL rate-limit sometimes.
-  try {
-    const q = await retry(() => yahooFinance.quote(ticker), 1);
-    const price = q?.regularMarketPrice ?? q?.postMarketPrice ?? q?.preMarketPrice;
-    const chg = q?.regularMarketChangePercent ?? 0;
-    const type = q?.quoteType || 'EQUITY';
-    if (price == null) throw new Error('No price on Yahoo quote');
-    return {
-      price: Number(price),
-      chg: Number(chg),
-      type,
-      vol: Number(q?.regularMarketVolume || 0),
-      avg: Number(q?.averageDailyVolume3Month || q?.averageVolume || 0),
-      source: 'Yahoo',
-      raw: q
-    };
-  } catch (e) {
-    if (isYahooRateLimitish(e)) throw e;
-    throw e;
-  }
+  const q = await retry(() => yahooFinance.quote(ticker), 1);
+  const price = q?.regularMarketPrice ?? q?.postMarketPrice ?? q?.preMarketPrice;
+  const chg = q?.regularMarketChangePercent ?? 0;
+  const type = q?.quoteType || 'EQUITY';
+  if (price == null) throw new Error('No price on Yahoo quote');
+  return {
+    price: Number(price),
+    chg: Number(chg),
+    type,
+    vol: Number(q?.regularMarketVolume || 0),
+    avg: Number(q?.averageDailyVolume3Month || q?.averageVolume || 0),
+    source: 'Yahoo',
+    raw: q
+  };
 }
 
 async function yahooHistorical(ticker, opts) {
-  try {
-    return await retry(() => yahooFinance.historical(ticker, opts), 1);
-  } catch (e) {
-    throw e;
-  }
+  return await retry(() => yahooFinance.historical(ticker, opts), 1);
 }
 
 async function yahooOptions(ticker, opts) {
-  try {
-    return await retry(() => yahooFinance.options(ticker, opts), 1);
-  } catch (e) {
-    throw e;
-  }
+  return await retry(() => yahooFinance.options(ticker, opts), 1);
 }
 
 // ---------- Unified quote (Polygon-first, Yahoo fallback) ------------------
@@ -257,7 +246,6 @@ async function getQuote(ticker) {
   // Prefer Polygon for equities
   const poly = await polygonQuote(t);
   if (poly) {
-    // If Yahoo is available, we can cross-check type and avg volume
     let y = null;
     try {
       y = await yahooQuoteFull(t);
@@ -265,10 +253,7 @@ async function getQuote(ticker) {
 
     const type = y?.type || 'EQUITY';
     const diff = y?.price ? Math.abs((poly.price - y.price) / y.price) * 100 : 0;
-    const flag =
-      y?.price && diff > DISC_BPS / 100
-        ? `⚠️ Discrepancy ${fmt(diff, 2)}% (Poly vs Y)`
-        : '';
+    const flag = y?.price && diff > DISC_BPS / 100 ? `⚠️ Discrepancy ${fmt(diff, 2)}% (Poly vs Y)` : '';
 
     return {
       price: poly.price,
@@ -286,9 +271,65 @@ async function getQuote(ticker) {
   }
 
   // Fallback to Yahoo
-  const y = await yahooQuoteFull(t);
-  return { ...y, session, alt: null, flag: '' };
+  try {
+    const y = await yahooQuoteFull(t);
+    return { ...y, session, alt: null, flag: '' };
+  } catch (e) {
+    // If Yahoo is blocked, return safe object instead of throwing
+    const msg = isYahooRateLimitish(e) ? 'Yahoo rate-limited/blocked' : 'Yahoo error';
+    return {
+      price: NaN,
+      chg: 0,
+      type: 'EQUITY',
+      session,
+      source: 'Yahoo',
+      flag: `⚠️ ${msg}`,
+      alt: null,
+      raw: { regularMarketVolume: 0, averageDailyVolume3Month: 0 }
+    };
+  }
 }
+
+// ---------- HARDEN: never allow provider failures to crash bot -------------
+const __getQuoteOriginal = getQuote;
+getQuote = async (ticker) => {
+  try {
+    const q = await __getQuoteOriginal(ticker);
+    const price = Number(q?.price);
+    const chg = Number(q?.chg ?? 0);
+
+    if (!Number.isFinite(price)) {
+      return {
+        price: NaN,
+        chg: 0,
+        type: q?.type || 'EQUITY',
+        session: q?.session || getSession(),
+        source: q?.source || 'UNKNOWN',
+        flag: q?.flag || '⚠️ No price returned',
+        alt: q?.alt ?? null,
+        raw: q?.raw || { regularMarketVolume: 0, averageDailyVolume3Month: 0 }
+      };
+    }
+
+    return {
+      ...q,
+      price,
+      chg: Number.isFinite(chg) ? chg : 0,
+      raw: q?.raw || { regularMarketVolume: 0, averageDailyVolume3Month: 0 }
+    };
+  } catch {
+    return {
+      price: NaN,
+      chg: 0,
+      type: 'EQUITY',
+      session: getSession(),
+      source: 'ERROR',
+      flag: '⚠️ Provider error (Yahoo/Polygon)',
+      alt: null,
+      raw: { regularMarketVolume: 0, averageDailyVolume3Month: 0 }
+    };
+  }
+};
 
 // ---------- RVOL -----------------------------------------------------------
 function estimateRVOLFromRaw(raw, session = 'OFF') {
@@ -394,18 +435,25 @@ function decideMode(q, ctx) {
   if (Number.isFinite(d.sma20) && Number.isFinite(d.sma50)) {
     const upTrend = d.sma20 > d.sma50;
     const downTrend = d.sma20 < d.sma50;
-
-    if (upTrend && q.price >= d.sma20 && (d.PDH ? q.price >= d.PDH : true)) return 'Swing Long';
-    if (downTrend && q.price <= d.sma20 && (d.PDL ? q.price <= d.PDL : true)) return 'Swing Short';
+    if (upTrend && Number.isFinite(q.price) && q.price >= d.sma20 && (d.PDH ? q.price >= d.PDH : true)) return 'Swing Long';
+    if (downTrend && Number.isFinite(q.price) && q.price <= d.sma20 && (d.PDL ? q.price <= d.PDL : true)) return 'Swing Short';
   }
   return 'Neutral / Range';
 }
 
 // ---------- Compact alert formatting --------------------------------------
 function bannerCompact(t, q, ctx = {}) {
-  const price = fmt(q.price);
-  const pct = (q.chg >= 0 ? '+' : '') + fmt(q.chg) + '%';
+  const price = Number.isFinite(q.price) ? fmt(q.price) : '—';
+  const pct = (q.chg >= 0 ? '+' : '') + fmt(Number.isFinite(q.chg) ? q.chg : 0) + '%';
   const biasEmoji = q.chg >= 0 ? '🟢' : '🟡';
+
+  if (!Number.isFinite(q.price)) {
+    return [
+      `⚡ **$${t}** — (${pct}) ${biasEmoji}`,
+      `🧭 Mode: Provider Error`,
+      `⚠️ ${q.flag || 'No price available'}`
+    ];
+  }
 
   const entryL = +(q.price * 0.995).toFixed(2);
   const entryH = +(q.price * 1.005).toFixed(2);
@@ -416,7 +464,7 @@ function bannerCompact(t, q, ctx = {}) {
 
   const flags = [
     ctx.trend ? (ctx.trend === 'up' ? '9>21' : '9<21') : null,
-    (ctx.rvol && ctx.rvol > 0) ? `RVOL ${fmt(ctx.rvol, 1)}x` : null
+    ctx.rvol && ctx.rvol > 0 ? `RVOL ${fmt(ctx.rvol, 1)}x` : null
   ].filter(Boolean);
 
   const flagStr = flags.length ? ` (${flags.join(', ')})` : '';
@@ -543,19 +591,19 @@ async function scanLowcapsTopN(n = 4) {
 
   for (const t of list) {
     try {
-      // Use unified quote; Polygon-first
       const q = await getQuote(t);
+      if (!Number.isFinite(q.price)) continue;
 
       const price = q.price;
       const chg = q.chg;
 
       const vol = Number(q.raw?.regularMarketVolume || 0);
       const avg = Number(q.raw?.averageDailyVolume3Month || 0);
-      const rvol = avg > 0 ? (vol / avg) : null;
+      const rvol = avg > 0 ? vol / avg : null;
 
       if (!(price >= 0.5 && price <= 7)) continue;
       if (vol < 200_000) continue;
-      if (rvol != null && rvol < 1.2) continue; // slightly looser when avg exists
+      if (rvol != null && rvol < 1.2) continue;
 
       let floatDisp = '—';
       if (POLY) {
@@ -570,15 +618,7 @@ async function scanLowcapsTopN(n = 4) {
       }
 
       const news = await polygonNewsHeadline(t);
-      out.push({
-        t,
-        price,
-        chg,
-        vol,
-        rvol: rvol ?? 0,
-        floatDisp,
-        news
-      });
+      out.push({ t, price, chg, vol, rvol: rvol ?? 0, floatDisp, news });
     } catch {}
   }
 
@@ -633,6 +673,8 @@ async function scanGappersTopN(n = 6) {
   for (const t of list) {
     try {
       const q = await getQuote(t);
+      if (!Number.isFinite(q.price)) continue;
+
       const price = q.price;
       const vol = Number(q.raw?.regularMarketVolume || 0);
       if (!(price >= 0.5 && price <= 20)) continue;
@@ -730,8 +772,7 @@ async function buildCompactBlock(t, q) {
     const ema9 = closes.length ? sma(closes, 9) : NaN;
     const ema21 = closes.length ? (sma(closes, 21) || sma(closes, 9)) : NaN;
 
-    ctx.trend =
-      Number.isFinite(ema9) && Number.isFinite(ema21) ? (ema9 >= ema21 ? 'up' : 'down') : null;
+    ctx.trend = Number.isFinite(ema9) && Number.isFinite(ema21) ? (ema9 >= ema21 ? 'up' : 'down') : null;
   } catch {
     ctx.trend = null;
   }
@@ -741,9 +782,10 @@ async function buildCompactBlock(t, q) {
 
   const lines = bannerCompact(t, q, ctx);
 
-  // options (guarded; can fail if Yahoo is blocked)
   const w =
-    (q.type === 'EQUITY' || q.type === 'ETF') ? await weeklyOptions(t, q.price).catch(() => null) : null;
+    (q.type === 'EQUITY' || q.type === 'ETF') && Number.isFinite(q.price)
+      ? await weeklyOptions(t, q.price).catch(() => null)
+      : null;
 
   const opt = optionsCompact(w);
   return [...lines, ...opt, '⛔ Invalidate: lose VWAP or hit SL'];
@@ -785,7 +827,7 @@ async function registerCommands() {
 
     new SlashCommandBuilder()
       .setName('scalp')
-      .setDescription('CRYPTO SCALPS: BTC/ETH/SOL/XRP/ADA/DOGE quick levels')
+      .setDescription('CRYPTO SCALPS: BTC-USD, ETH-USD, etc.')
       .addStringOption((o) => o.setName('symbol').setDescription('e.g., BTC-USD').setRequired(false)),
 
     new SlashCommandBuilder().setName('health').setDescription('Health check: data + time + session'),
@@ -793,15 +835,8 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('schedule_add')
       .setDescription('Add an auto-post schedule')
-      .addStringOption((o) =>
-        o
-          .setName('cron')
-          .setDescription('Cron like 0 9 * * 1-5 or */1 * * * *')
-          .setRequired(true)
-      )
-      .addStringOption((o) =>
-        o.setName('tickers').setDescription('Tickers (comma/space-separated, max 4)').setRequired(true)
-      )
+      .addStringOption((o) => o.setName('cron').setDescription('Cron like 0 9 * * 1-5 or */1 * * * *').setRequired(true))
+      .addStringOption((o) => o.setName('tickers').setDescription('Tickers (comma/space-separated, max 4)').setRequired(true))
       .addChannelOption((o) =>
         o.setName('channel').setDescription('Channel to post in').addChannelTypes(ChannelType.GuildText).setRequired(false)
       ),
@@ -890,12 +925,14 @@ client.on('interactionCreate', async (i) => {
       const d = await buildDailyContext(t, TZSTR);
       const trend =
         Number.isFinite(d.sma20) && Number.isFinite(d.sma50)
-          ? (d.sma20 > d.sma50 ? '🟢 Up (20>50)' : '🟡 Mixed/Down (20<=50)')
+          ? d.sma20 > d.sma50
+            ? '🟢 Up (20>50)'
+            : '🟡 Mixed/Down (20<=50)'
           : '—';
 
       await i.editReply(
         [
-          `DEEP DIVE 📚 — ${t} @ ${fmt(q.price)} (${q.chg >= 0 ? '+' : ''}${fmt(q.chg)}%) — ${ts()}`,
+          `DEEP DIVE 📚 — ${t} @ ${Number.isFinite(q.price) ? fmt(q.price) : '—'} (${q.chg >= 0 ? '+' : ''}${fmt(q.chg)}%) — ${ts()}`,
           `• Type: ${q.type} | Session: ${q.session} | Source: ${q.source}${q.flag ? ` | ${q.flag}` : ''}`,
           `• Trend: ${trend}`,
           `• PDH/PDL: ${d.PDH ? fmt(d.PDH) : '—'}/${d.PDL ? fmt(d.PDL) : '—'}`,
@@ -910,6 +947,11 @@ client.on('interactionCreate', async (i) => {
 
       const sym = norm(i.options.getString('symbol') || 'BTC-USD');
       const q = await getQuote(sym);
+
+      if (!Number.isFinite(q.price)) {
+        await i.editReply(`CRYPTO SCALP ⚡ — ${sym}\n⚠️ ${q.flag || 'No price available right now.'}`);
+        return;
+      }
 
       const r = 0.006;
       const s1 = +(q.price * (1 - r)).toFixed(2);
@@ -932,14 +974,14 @@ client.on('interactionCreate', async (i) => {
     if (i.commandName === 'health') {
       await i.deferReply({ ephemeral: false });
 
-      // Polygon test
       let polyLine = `• Polygon: ${POLY ? 'present' : 'missing'}`;
       if (POLY) {
         const p = await polygonQuote('SPY').catch(() => null);
-        polyLine = p ? `• Polygon: OK — SPY ${fmt(p.price)} (${p.chg >= 0 ? '+' : ''}${fmt(p.chg)}%)` : '• Polygon: present (but request failed)';
+        polyLine = p
+          ? `• Polygon: OK — SPY ${fmt(p.price)} (${p.chg >= 0 ? '+' : ''}${fmt(p.chg)}%)`
+          : '• Polygon: present (but request failed)';
       }
 
-      // Yahoo test (best effort)
       let yahooLine = '• Yahoo: unavailable (rate limited?)';
       try {
         const y = await yahooQuoteFull('SPY');
@@ -965,7 +1007,7 @@ client.on('interactionCreate', async (i) => {
       const cronStr = i.options.getString('cron');
       const tickStr = clean(i.options.getString('tickers'));
       const chOpt = i.options.getChannel('channel');
-      const channelId = (chOpt?.id) || (DEFAULT_CHANNEL_ID || i.channelId);
+      const channelId = chOpt?.id || DEFAULT_CHANNEL_ID || i.channelId;
 
       if (!cron.validate(cronStr)) {
         await i.editReply(`❌ Invalid cron: ${cronStr}\nExamples:\n• 0 9 * * 1-5\n• 30 15 * * 1-5\n• */1 * * * * (testing)`);
@@ -1028,7 +1070,7 @@ client.on('interactionCreate', async (i) => {
     if (i.commandName === 'scan_lowcap') {
       await i.deferReply({ ephemeral: false });
       const chOpt = i.options.getChannel('channel');
-      const channelId = (chOpt?.id) || (DEFAULT_CHANNEL_ID || i.channelId);
+      const channelId = chOpt?.id || DEFAULT_CHANNEL_ID || i.channelId;
       await postLowcapTopN(channelId, 4);
       await i.editReply(`✅ Low-cap Top 4 posted in <#${channelId}>`);
       return;
@@ -1037,12 +1079,11 @@ client.on('interactionCreate', async (i) => {
     if (i.commandName === 'scan_gappers') {
       await i.deferReply({ ephemeral: false });
       const chOpt = i.options.getChannel('channel');
-      const channelId = (chOpt?.id) || (DEFAULT_CHANNEL_ID || i.channelId);
+      const channelId = chOpt?.id || DEFAULT_CHANNEL_ID || i.channelId;
       await postGapperScan(channelId, 6);
       await i.editReply(`✅ Gapper scan posted in <#${channelId}>`);
       return;
     }
-
   } catch (e) {
     console.error('interaction error:', e?.message || e);
     try {
@@ -1052,6 +1093,8 @@ client.on('interactionCreate', async (i) => {
 });
 
 // ---------- Startup --------------------------------------------------------
+// NOTE: That discord.js warning about "ready renamed to clientReady" is only a warning.
+// If you ever upgrade to discord.js v15, switch to Events.ClientReady.
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   loadSchedules();
@@ -1100,7 +1143,8 @@ process.on('unhandledRejection', (err) => console.error('Unhandled:', err));
 registerCommands()
   .catch((e) => console.warn('Command registration threw (continuing):', e?.message || e))
   .finally(() => {
-    client.login(TOKEN)
+    client
+      .login(TOKEN)
       .then(() => console.log('Logged in OK'))
       .catch((e) => console.error('Login failed:', e?.message || e));
   });
