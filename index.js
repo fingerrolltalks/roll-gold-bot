@@ -56,6 +56,8 @@ console.log("Boot (Polygon Snapshot)", {
   POLY_DEBUG,
 });
 
+console.log("POLYGON KEY PREFIX:", (process.env.POLYGON_KEY || "").slice(0, 8));
+
 const http = axios.create({
   timeout: 12000,
   headers: { "User-Agent": "RollGPT/PolygonSnapshot/1.0" },
@@ -94,7 +96,6 @@ async function polygonSnapshotStock(ticker) {
     const r = await http.get(url, { params: { apiKey: POLY } });
     const d = r.data;
 
-    // Polygon snapshot shape can vary; we handle common fields:
     const last = d?.ticker?.lastTrade?.p ?? d?.ticker?.lastQuote?.P ?? null;
     const day = d?.ticker?.day ?? null;
     const prev = d?.ticker?.prevDay ?? null;
@@ -123,8 +124,6 @@ async function polygonSnapshotStock(ticker) {
 }
 
 async function getQuote(ticker) {
-  // For now: ONLY stocks via Polygon snapshot.
-  // If you later want crypto, we’ll add the crypto snapshot endpoints separately.
   return polygonSnapshotStock(ticker);
 }
 
