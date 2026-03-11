@@ -33,7 +33,7 @@ if (!POLY) {
   process.exit(1);
 }
 
-console.log("Boot (Polygon Prev)", {
+console.log("Boot (RollGPT Trading Assistant Lite)", {
   TZ: TZSTR,
   GUILD_ID: !!GUILD_ID,
   DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID,
@@ -43,10 +43,11 @@ console.log("POLYGON KEY PREFIX:", (process.env.POLYGON_KEY || "").slice(0, 8));
 
 const http = axios.create({
   timeout: 12000,
-  headers: { "User-Agent": "RollGPT/PolygonPrev/1.0" },
+  headers: { "User-Agent": "RollGPT/PolygonPrev/TradingAssistant/1.0" },
 });
 
-const ts = () => dayjs().tz(TZSTR).format("MMM D, HH:mm z");
+const nowET = () => dayjs().tz(TZSTR);
+const ts = () => nowET().format("MMM D, h:mm A");
 const fmt = (n, d = 2) => Number(n).toFixed(d);
 
 const clean = (s) => (s == null ? "" : String(s).trim());
@@ -61,7 +62,7 @@ function polygonErrorSummary(e) {
   };
 }
 
-// Uses the endpoint you already proved works in browser
+// ---------------- Polygon prev close ----------------
 async function polygonPrevClose(ticker) {
   const t = normTicker(ticker);
   const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(t)}/prev`;
@@ -85,6 +86,7 @@ async function polygonPrevClose(ticker) {
     const low = Number(row.l ?? row.c);
     const vol = Number(row.v || 0);
     const chgPct = open ? ((close - open) / open) * 100 : 0;
+    const rangePct = open ? ((high - low) / open) * 100 : 0;
 
     return {
       ticker: t,
@@ -94,6 +96,7 @@ async function polygonPrevClose(ticker) {
       high,
       low,
       vol,
+      rangePct,
       source: "PolygonPrev",
     };
   } catch (e) {
@@ -106,13 +109,131 @@ async function getQuote(ticker) {
   return polygonPrevClose(ticker);
 }
 
+// ---------------- Trading assistant logic ----------------
+function computeTradePlan(q) {
+  const price = q.price;
+  const high = q.high;
+  const low = q.low;
+  const open = q.open;
+  const range = Math.max(0.01, high - low);
+  const rangePct = q.rangePct;
+
+  let mode = "Neutral / Range";
+  if (price > open && price >= open + range * 0.35) mode = "Breakout Watch";
+  else if (price < open && price <= open - range * 0.35) mode = "Weak / Fade Watch";
+  else if (price > open) mode = "Pullback Long Watch";
+
+  const entryLow = +(price - range * 0.08).toFixed(2);
+  const entryHigh = +(price + range * 0.08).toFixed(2);
+
+  const t1 = +(price + range * 0.35).toFixed(2);
+  const t2 = +(price + range * 0.70).toFixed(2);
+  const t3 = +(price + range * 1.05).toFixed(2);
+
+  const sl = +(price - range * 0.35).toFixed(2);
+
+  let risk = "Low";
+  if (rangePct >= 2.25) risk = "High";
+  else if (rangePct >= 1.1) risk = "Medium";
+
+  const score =
+    (q.chgPct * 1.8) +
+    (rangePct * 1.5) +
+    (Math.log10(Math.max(q.vol, 1)) - 6.5) * 2;
+
+  return {
+    mode,
+    entryLow,
+    entryHigh,
+    t1,
+    t2,
+    t3,
+    sl,
+    risk,
+    score,
+  };
+}
+
+function buildAlertBlock(q) {
+  const plan = computeTradePlan(q);
+  const pct = `${q.chgPct >= 0 ? "+" : ""}${fmt(q.chgPct)}%`;
+
+  return [
+    `⚡ **$${q.ticker} ${fmt(q.price)} (${pct})**`,
+    `🧭 Mode: **${plan.mode}**`,
+    `🎯 Targets: **${fmt(plan.t1)} / ${fmt(plan.t2)} / ${fmt(plan.t3)}**`,
+    `🚫 SL: **${fmt(plan.sl)}** | Entry: **${fmt(plan.entryLow)}–${fmt(plan.entryHigh)}**`,
+    `⛔ Invalidate: lose entry support or hit SL`,
+    `📊 Vol: **${q.vol.toLocaleString()}** | Risk: **${plan.risk}** | Source: **${q.source}** | ${ts()} ET`,
+  ].join("\n");
+}
+
+function buildBiasFromQuotes(quotes) {
+  const spy = quotes.find((q) => q.ticker === "SPY");
+  const qqq = quotes.find((q) => q.ticker === "QQQ");
+
+  const spyUp = spy ? spy.price > spy.open : false;
+  const qqqUp = qqq ? qqq.price > qqq.open : false;
+
+  let bias = "Mixed / Watch Open";
+  let note = "Focus on clean confirmations, avoid forcing trades.";
+
+  if (spyUp && qqqUp) {
+    bias = "Bullish / Risk-On";
+    note = "Leaders are above open. Focus on continuation names.";
+  } else if (!spyUp && !qqqUp) {
+    bias = "Bearish / Defensive";
+    note = "Market pressure is weak. Focus on breakdowns or quick scalps only.";
+  }
+
+  return { bias, note };
+}
+
+function buildWatchlistPost(quotes) {
+  const valid = quotes
+    .map((q) => ({ q, plan: computeTradePlan(q) }))
+    .sort((a, b) => b.plan.score - a.plan.score);
+
+  const { bias, note } = buildBiasFromQuotes(quotes);
+  const top = valid.slice(0, 4);
+  const best = top[0];
+
+  const lines = [];
+  lines.push(`🚨 **RollGPT Morning Plan — ${ts()} ET**`);
+  lines.push("");
+  lines.push(`📌 **Market Bias:** ${bias}`);
+  lines.push(`• ${note}`);
+  lines.push("");
+
+  lines.push(`🔥 **Priority Watchlist**`);
+  top.forEach((item, idx) => {
+    const q = item.q;
+    const p = item.plan;
+    const pct = `${q.chgPct >= 0 ? "+" : ""}${fmt(q.chgPct)}%`;
+
+    lines.push(
+      `${idx + 1}. **${q.ticker}** — ${p.mode} | ${pct}`
+    );
+    lines.push(`• Entry: **${fmt(p.entryLow)}–${fmt(p.entryHigh)}**`);
+    lines.push(`• Targets: **${fmt(p.t1)} / ${fmt(p.t2)} / ${fmt(p.t3)}**`);
+    lines.push(`• SL: **${fmt(p.sl)}** | Risk: **${p.risk}**`);
+  });
+
+  if (best) {
+    lines.push("");
+    lines.push(`⭐ **Best Setup:** ${best.q.ticker}`);
+    lines.push(`⚠️ **Risk Note:** Wait for confirmation. Don’t chase the first candle.`);
+  }
+
+  return lines.join("\n");
+}
+
 // ---------------- Schedules ----------------
 const SFILE = "schedules.json";
 let SCHEDULES = [];
 const JOBS = new Map();
 let NEXT_ID = 1;
 
-// default built-in schedule
 const DEFAULT_BUILTIN = {
   cron: "0 9 * * 1,3,5",
   tickers: ["SPY", "QQQ", "NVDA", "TSLA"],
@@ -151,7 +272,7 @@ function startJob(entry) {
     entry.cron,
     async () => {
       try {
-        await postAlert(entry.tickers, entry.channelId);
+        await postWatchlist(entry.tickers, entry.channelId);
       } catch (e) {
         console.error("Scheduled post error:", e?.message || e);
       }
@@ -202,21 +323,11 @@ function ensureDefaultSchedule() {
   SCHEDULES.push(entry);
   saveSchedules();
   startJob(entry);
-  console.log("Default M/W/F 9:00 AM schedule created.");
+  console.log("Default M/W/F 9:00 AM watchlist schedule created.");
 }
 
 // ---------------- Discord ----------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-function buildLinesFromQuote(q) {
-  const pct = (q.chgPct >= 0 ? "+" : "") + fmt(q.chgPct) + "%";
-  return [
-    `⚡ **$${q.ticker}** — ${fmt(q.price)} (${pct})`,
-    `• Open: ${fmt(q.open)} | High: ${fmt(q.high)} | Low: ${fmt(q.low)}`,
-    `• Volume: ${q.vol.toLocaleString()}`,
-    `• Source: ${q.source} | ${ts()}`,
-  ].join("\n");
-}
 
 async function postAlert(tickers, channelId) {
   const ch = await client.channels.fetch(channelId);
@@ -226,7 +337,7 @@ async function postAlert(tickers, channelId) {
   for (const t of list) {
     try {
       const q = await getQuote(t);
-      blocks.push(buildLinesFromQuote(q));
+      blocks.push(buildAlertBlock(q));
     } catch (e) {
       const poly = e?._poly;
       const extra = poly?.status ? ` (status ${poly.status})` : "";
@@ -237,13 +348,52 @@ async function postAlert(tickers, channelId) {
   await ch.send(blocks.join("\n\n"));
 }
 
+async function postWatchlist(tickers, channelId) {
+  const ch = await client.channels.fetch(channelId);
+  const list = (tickers || []).map(normTicker).filter(isTicker).slice(0, 4);
+
+  const quotes = [];
+  const errors = [];
+
+  for (const t of list) {
+    try {
+      const q = await getQuote(t);
+      quotes.push(q);
+    } catch (e) {
+      const poly = e?._poly;
+      const extra = poly?.status ? ` (status ${poly.status})` : "";
+      errors.push(`⚠️ **$${t}** — Polygon failed${extra}.`);
+    }
+  }
+
+  if (!quotes.length) {
+    await ch.send(errors.join("\n") || "⚠️ Watchlist failed. Check Railway logs.");
+    return;
+  }
+
+  const post = buildWatchlistPost(quotes);
+  await ch.send(post);
+
+  if (errors.length) {
+    await ch.send(errors.join("\n"));
+  }
+}
+
+// ---------------- Commands ----------------
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
       .setName("alert")
-      .setDescription("Run a quick scan")
+      .setDescription("Run a Chart Assassin-style quick scan")
       .addStringOption((o) =>
         o.setName("text").setDescription("e.g. SPY or SPY QQQ NVDA TSLA").setRequired(false)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("watchlist")
+      .setDescription("Post the morning-plan style watchlist")
+      .addStringOption((o) =>
+        o.setName("text").setDescription("e.g. SPY QQQ NVDA TSLA").setRequired(false)
       ),
 
     new SlashCommandBuilder()
@@ -286,6 +436,7 @@ async function registerCommands() {
   }
 }
 
+// ---------------- Interaction handlers ----------------
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
 
@@ -308,7 +459,7 @@ client.on("interactionCreate", async (i) => {
       for (const t of list) {
         try {
           const q = await getQuote(t);
-          lines.push(buildLinesFromQuote(q));
+          lines.push(buildAlertBlock(q));
         } catch (e) {
           const poly = e?._poly;
           const extra = poly?.status ? ` (status ${poly.status})` : "";
@@ -320,18 +471,58 @@ client.on("interactionCreate", async (i) => {
       return;
     }
 
+    if (i.commandName === "watchlist") {
+      await i.deferReply({ ephemeral: false });
+
+      const text = clean(i.options.getString("text") || "SPY QQQ NVDA TSLA");
+      const parts = text
+        .replace(/[“”‘’"]/g, "")
+        .replace(/\$/g, "")
+        .toUpperCase()
+        .split(/[^A-Z0-9.\-]+/)
+        .filter(Boolean);
+
+      const tickers = [...new Set(parts.filter(isTicker))].slice(0, 4);
+      const list = tickers.length ? tickers : ["SPY", "QQQ", "NVDA", "TSLA"];
+
+      const quotes = [];
+      const errors = [];
+
+      for (const t of list) {
+        try {
+          const q = await getQuote(t);
+          quotes.push(q);
+        } catch (e) {
+          const poly = e?._poly;
+          const extra = poly?.status ? ` (status ${poly.status})` : "";
+          errors.push(`⚠️ **$${t}** — Polygon failed${extra}.`);
+        }
+      }
+
+      if (!quotes.length) {
+        await i.editReply(errors.join("\n") || "⚠️ Watchlist failed.");
+        return;
+      }
+
+      let reply = buildWatchlistPost(quotes);
+      if (errors.length) reply += `\n\n${errors.join("\n")}`;
+
+      await i.editReply(reply);
+      return;
+    }
+
     if (i.commandName === "health") {
       await i.deferReply({ ephemeral: false });
 
       try {
         const q = await getQuote("SPY");
         await i.editReply(
-          `HEALTH ✅ — ${ts()}\nPolygon: OK — SPY ${fmt(q.price)} (${fmt(q.chgPct)}%)`
+          `HEALTH ✅ — ${ts()} ET\nPolygon: OK — SPY ${fmt(q.price)} (${fmt(q.chgPct)}%)`
         );
       } catch (e) {
         const poly = e?._poly;
         await i.editReply(
-          `HEALTH ⚠️ — ${ts()}\nPolygon failed${poly?.status ? ` (status ${poly.status})` : ""}\nCheck Railway logs.`
+          `HEALTH ⚠️ — ${ts()} ET\nPolygon failed${poly?.status ? ` (status ${poly.status})` : ""}\nCheck Railway logs.`
         );
       }
       return;
@@ -415,6 +606,7 @@ client.on("interactionCreate", async (i) => {
   }
 });
 
+// ---------------- Startup ----------------
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
   loadSchedules();
