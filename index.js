@@ -1,17 +1,3 @@
-// RollGPT — Discord Alerts Bot (Polygon Snapshot)
-// Purpose: Make /alert reliable + expose real provider errors (no more silent fails)
-//
-// ENV (Railway -> Variables)
-//   DISCORD_TOKEN
-//   DISCORD_CLIENT_ID
-//   DISCORD_GUILD_ID (optional, faster commands)
-//   DISCORD_CHANNEL_ID (optional default channel for schedules)
-//   POLYGON_KEY
-//   TZ=America/New_York
-//
-// Optional:
-//   POLYGON_DEBUG=1 (prints more provider error detail)
-
 import "dotenv/config";
 import {
   Client,
@@ -37,7 +23,6 @@ const GUILD_ID = process.env.DISCORD_GUILD_ID || "";
 const DEFAULT_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || "";
 const POLY = process.env.POLYGON_KEY || "";
 const TZSTR = process.env.TZ || "America/New_York";
-const POLY_DEBUG = String(process.env.POLYGON_DEBUG || "") === "1";
 
 if (!TOKEN || !CLIENT_ID) {
   console.error("❌ Missing DISCORD_TOKEN or DISCORD_CLIENT_ID");
@@ -48,19 +33,17 @@ if (!POLY) {
   process.exit(1);
 }
 
-console.log("Boot (Polygon Snapshot)", {
+console.log("Boot (Polygon Prev)", {
   TZ: TZSTR,
   GUILD_ID: !!GUILD_ID,
   DEFAULT_CHANNEL_ID: !!DEFAULT_CHANNEL_ID,
   POLY: !!POLY,
-  POLY_DEBUG,
 });
-
 console.log("POLYGON KEY PREFIX:", (process.env.POLYGON_KEY || "").slice(0, 8));
 
 const http = axios.create({
   timeout: 12000,
-  headers: { "User-Agent": "RollGPT/PolygonSnapshot/1.0" },
+  headers: { "User-Agent": "RollGPT/PolygonPrev/1.0" },
 });
 
 const ts = () => dayjs().tz(TZSTR).format("MMM D, HH:mm z");
@@ -71,67 +54,69 @@ const normTicker = (s) => clean(s).toUpperCase().replace(/\$/g, "").replace(/\s+
 const isTicker = (s) => /^[A-Z][A-Z0-9.\-]{0,10}$/.test(normTicker(s));
 
 function polygonErrorSummary(e) {
-  const status = e?.response?.status;
-  const data = e?.response?.data;
-  const msg = e?.message || String(e);
-
-  let body = "";
-  try {
-    body = typeof data === "string" ? data.slice(0, 240) : JSON.stringify(data).slice(0, 240);
-  } catch {
-    body = "";
-  }
-
-  return { status, msg, body };
+  return {
+    status: e?.response?.status,
+    data: e?.response?.data,
+    message: e?.message || String(e),
+  };
 }
 
-// Polygon Snapshot (stocks)
-async function polygonSnapshotStock(ticker) {
+// Uses the endpoint you already proved works in browser
+async function polygonPrevClose(ticker) {
   const t = normTicker(ticker);
-  const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(
-    t
-  )}`;
+  const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(t)}/prev`;
 
   try {
-    const r = await http.get(url, { params: { apiKey: POLY } });
-    const d = r.data;
+    const r = await http.get(url, {
+      params: {
+        adjusted: true,
+        apiKey: POLY,
+      },
+    });
 
-    const last = d?.ticker?.lastTrade?.p ?? d?.ticker?.lastQuote?.P ?? null;
-    const day = d?.ticker?.day ?? null;
-    const prev = d?.ticker?.prevDay ?? null;
-
-    const price = Number.isFinite(Number(last))
-      ? Number(last)
-      : Number.isFinite(Number(day?.c))
-      ? Number(day.c)
-      : null;
-
-    const prevClose = Number.isFinite(Number(prev?.c)) ? Number(prev.c) : null;
-    const chgPct = prevClose && price ? ((price - prevClose) / prevClose) * 100 : 0;
-
-    if (!Number.isFinite(price)) {
-      throw new Error(`Polygon snapshot returned no price for ${t}`);
+    const row = r?.data?.results?.[0];
+    if (!row || !Number.isFinite(Number(row.c))) {
+      throw new Error(`No prev close returned for ${t}`);
     }
 
-    const vol = Number(day?.v || 0);
+    const close = Number(row.c);
+    const open = Number(row.o ?? row.c);
+    const high = Number(row.h ?? row.c);
+    const low = Number(row.l ?? row.c);
+    const vol = Number(row.v || 0);
+    const chgPct = open ? ((close - open) / open) * 100 : 0;
 
-    return { ticker: t, price, chgPct, vol, source: "PolygonSnapshot" };
+    return {
+      ticker: t,
+      price: close,
+      chgPct,
+      open,
+      high,
+      low,
+      vol,
+      source: "PolygonPrev",
+    };
   } catch (e) {
     const info = polygonErrorSummary(e);
-    if (POLY_DEBUG) console.error("POLYGON_DEBUG snapshot fail:", ticker, info);
-    throw Object.assign(new Error(`Polygon snapshot failed (${ticker})`), { _poly: info });
+    throw Object.assign(new Error(`Polygon prev failed (${t})`), { _poly: info });
   }
 }
 
 async function getQuote(ticker) {
-  return polygonSnapshotStock(ticker);
+  return polygonPrevClose(ticker);
 }
 
-// ---------------- Schedules (simple + persistent file) ----------------
+// ---------------- Schedules ----------------
 const SFILE = "schedules.json";
 let SCHEDULES = [];
 const JOBS = new Map();
 let NEXT_ID = 1;
+
+// default built-in schedule
+const DEFAULT_BUILTIN = {
+  cron: "0 9 * * 1,3,5",
+  tickers: ["SPY", "QQQ", "NVDA", "TSLA"],
+};
 
 function loadSchedules() {
   try {
@@ -161,6 +146,7 @@ function startJob(entry) {
     console.error("Invalid cron, skip id", entry.id, entry.cron);
     return;
   }
+
   const job = cron.schedule(
     entry.cron,
     async () => {
@@ -172,6 +158,7 @@ function startJob(entry) {
     },
     { timezone: TZSTR }
   );
+
   JOBS.set(entry.id, job);
 }
 
@@ -189,8 +176,47 @@ function restartAllJobs() {
   for (const e of SCHEDULES) startJob(e);
 }
 
+function ensureDefaultSchedule() {
+  if (!DEFAULT_CHANNEL_ID) return;
+
+  const alreadyExists = SCHEDULES.some(
+    (e) =>
+      e.cron === DEFAULT_BUILTIN.cron &&
+      Array.isArray(e.tickers) &&
+      e.tickers.join(",") === DEFAULT_BUILTIN.tickers.join(",") &&
+      e.channelId === DEFAULT_CHANNEL_ID
+  );
+
+  if (alreadyExists) {
+    console.log("Default schedule already exists.");
+    return;
+  }
+
+  const entry = {
+    id: NEXT_ID++,
+    cron: DEFAULT_BUILTIN.cron,
+    tickers: DEFAULT_BUILTIN.tickers,
+    channelId: DEFAULT_CHANNEL_ID,
+  };
+
+  SCHEDULES.push(entry);
+  saveSchedules();
+  startJob(entry);
+  console.log("Default M/W/F 9:00 AM schedule created.");
+}
+
 // ---------------- Discord ----------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+function buildLinesFromQuote(q) {
+  const pct = (q.chgPct >= 0 ? "+" : "") + fmt(q.chgPct) + "%";
+  return [
+    `⚡ **$${q.ticker}** — ${fmt(q.price)} (${pct})`,
+    `• Open: ${fmt(q.open)} | High: ${fmt(q.high)} | Low: ${fmt(q.low)}`,
+    `• Volume: ${q.vol.toLocaleString()}`,
+    `• Source: ${q.source} | ${ts()}`,
+  ].join("\n");
+}
 
 async function postAlert(tickers, channelId) {
   const ch = await client.channels.fetch(channelId);
@@ -200,40 +226,38 @@ async function postAlert(tickers, channelId) {
   for (const t of list) {
     try {
       const q = await getQuote(t);
-      const pct = (q.chgPct >= 0 ? "+" : "") + fmt(q.chgPct) + "%";
-      blocks.push(`⚡ **$${q.ticker}** — ${fmt(q.price)} (${pct})`);
+      blocks.push(buildLinesFromQuote(q));
     } catch (e) {
       const poly = e?._poly;
       const extra = poly?.status ? ` (status ${poly.status})` : "";
       blocks.push(`⚠️ **$${t}** — Polygon failed${extra}. Check Railway logs.`);
-      if (POLY_DEBUG && poly) {
-        blocks.push(`\`\`\`txt\n${poly.msg}\n${poly.body}\n\`\`\``);
-      }
     }
   }
 
-  await ch.send(blocks.join("\n"));
+  await ch.send(blocks.join("\n\n"));
 }
 
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
       .setName("alert")
-      .setDescription("Get a quick quote via Polygon Snapshot")
+      .setDescription("Run a quick scan")
       .addStringOption((o) =>
-        o.setName("text").setDescription("e.g., SPY or SPY QQQ NVDA").setRequired(false)
+        o.setName("text").setDescription("e.g. SPY or SPY QQQ NVDA TSLA").setRequired(false)
       ),
 
     new SlashCommandBuilder()
       .setName("health")
-      .setDescription("Provider health check (Polygon)"),
+      .setDescription("Health check (Polygon prev)"),
 
     new SlashCommandBuilder()
       .setName("schedule_add")
-      .setDescription("Add a schedule (cron) to post /alert")
-      .addStringOption((o) => o.setName("cron").setDescription("Cron e.g. 0 9 * * 1-5").setRequired(true))
+      .setDescription("Add a schedule")
       .addStringOption((o) =>
-        o.setName("tickers").setDescription("Tickers (space/comma, max 4)").setRequired(true)
+        o.setName("cron").setDescription("Cron example: 0 9 * * 1,3,5").setRequired(true)
+      )
+      .addStringOption((o) =>
+        o.setName("tickers").setDescription("Tickers, max 4").setRequired(true)
       )
       .addChannelOption((o) =>
         o.setName("channel").setDescription("Channel").addChannelTypes(ChannelType.GuildText).setRequired(false)
@@ -269,7 +293,7 @@ client.on("interactionCreate", async (i) => {
     if (i.commandName === "alert") {
       await i.deferReply({ ephemeral: false });
 
-      const text = clean(i.options.getString("text") || "SPY");
+      const text = clean(i.options.getString("text") || "SPY QQQ NVDA TSLA");
       const parts = text
         .replace(/[“”‘’"]/g, "")
         .replace(/\$/g, "")
@@ -278,14 +302,13 @@ client.on("interactionCreate", async (i) => {
         .filter(Boolean);
 
       const tickers = [...new Set(parts.filter(isTicker))].slice(0, 4);
-      const list = tickers.length ? tickers : ["SPY"];
+      const list = tickers.length ? tickers : ["SPY", "QQQ", "NVDA", "TSLA"];
 
       const lines = [];
       for (const t of list) {
         try {
           const q = await getQuote(t);
-          const pct = (q.chgPct >= 0 ? "+" : "") + fmt(q.chgPct) + "%";
-          lines.push(`⚡ **$${q.ticker}** — ${fmt(q.price)} (${pct})`);
+          lines.push(buildLinesFromQuote(q));
         } catch (e) {
           const poly = e?._poly;
           const extra = poly?.status ? ` (status ${poly.status})` : "";
@@ -293,15 +316,18 @@ client.on("interactionCreate", async (i) => {
         }
       }
 
-      await i.editReply(lines.join("\n"));
+      await i.editReply(lines.join("\n\n"));
       return;
     }
 
     if (i.commandName === "health") {
       await i.deferReply({ ephemeral: false });
+
       try {
         const q = await getQuote("SPY");
-        await i.editReply(`HEALTH ✅ — ${ts()}\nPolygon: OK — SPY ${fmt(q.price)} (${fmt(q.chgPct)}%)`);
+        await i.editReply(
+          `HEALTH ✅ — ${ts()}\nPolygon: OK — SPY ${fmt(q.price)} (${fmt(q.chgPct)}%)`
+        );
       } catch (e) {
         const poly = e?._poly;
         await i.editReply(
@@ -320,7 +346,7 @@ client.on("interactionCreate", async (i) => {
       const channelId = chOpt?.id || DEFAULT_CHANNEL_ID || i.channelId;
 
       if (!cron.validate(cronStr)) {
-        await i.editReply(`❌ Invalid cron: ${cronStr}\nExample: 0 9 * * 1-5`);
+        await i.editReply(`❌ Invalid cron: ${cronStr}\nExample: 0 9 * * 1,3,5`);
         return;
       }
 
@@ -343,16 +369,20 @@ client.on("interactionCreate", async (i) => {
       saveSchedules();
       startJob(entry);
 
-      await i.editReply(`✅ Added schedule #${entry.id}\n• ${entry.cron}\n• ${entry.tickers.join(", ")}\n• <#${entry.channelId}>`);
+      await i.editReply(
+        `✅ Added schedule #${entry.id}\n• ${entry.cron}\n• ${entry.tickers.join(", ")}\n• <#${entry.channelId}>`
+      );
       return;
     }
 
     if (i.commandName === "schedule_list") {
       await i.deferReply({ ephemeral: true });
+
       if (!SCHEDULES.length) {
         await i.editReply("No schedules yet.");
         return;
       }
+
       await i.editReply(
         SCHEDULES.map((e) => `#${e.id} — ${e.cron} → [${e.tickers.join(", ")}] → <#${e.channelId}>`).join("\n")
       );
@@ -361,15 +391,19 @@ client.on("interactionCreate", async (i) => {
 
     if (i.commandName === "schedule_remove") {
       await i.deferReply({ ephemeral: true });
+
       const id = i.options.getInteger("id");
       const idx = SCHEDULES.findIndex((e) => e.id === id);
+
       if (idx === -1) {
         await i.editReply(`❌ Schedule #${id} not found.`);
         return;
       }
+
       stopJob(id);
       const removed = SCHEDULES.splice(idx, 1)[0];
       saveSchedules();
+
       await i.editReply(`🗑️ Removed schedule #${id}: ${removed.cron} [${removed.tickers.join(", ")}]`);
       return;
     }
@@ -385,6 +419,7 @@ client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
   loadSchedules();
   restartAllJobs();
+  ensureDefaultSchedule();
 });
 
 process.on("uncaughtException", (err) => console.error("Uncaught:", err));
